@@ -1,0 +1,22 @@
+services:
+  malkin:
+    build: .
+    image: malkin:local
+    ports:
+      - "127.0.0.1:${PORT:-8080}:8080"
+    volumes:
+      - "${MODELS_DIR:?set MODELS_DIR to the directory holding your GGUF files}:/models:ro"
+    command: ["--model", "/models/${MODEL:?set MODEL to a GGUF file name}"]
+    restart: unless-stopped
+
+  # Dev shell with the toolchain; the repo is mounted at /src.
+  dev:
+    build:
+      context: .
+      target: deps
+    image: malkin-dev:local
+    profiles: [dev]
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - .:/src
+    working_dir: /src

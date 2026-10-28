@@ -1,0 +1,25 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # arm64: cross-compiled, tests under qemu -cpu neoverse-n1. amd64: tests skip (exit 77) without AVX-512 BF16.
+      - name: kernel tests
+        run: docker buildx build --platform ${{ matrix.platform }} --target test --progress plain .
+      - name: runtime image
+        run: docker buildx build --platform ${{ matrix.platform }} --target runtime .
