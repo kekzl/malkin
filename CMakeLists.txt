@@ -1,12 +1,19 @@
-cmake_minimum_required(VERSION 3.28)
+cmake_minimum_required(VERSION 4.0)
 project(malkin VERSION 0.1.0 LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
+endif()
+
+# Primary toolchain: clang + libc++ + lld (Dockerfile pins LLVM 23). GCC 16 builds too, for comparison.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+  add_compile_options(-stdlib=libc++)
+  add_link_options(-stdlib=libc++)
+  set(CMAKE_LINKER_TYPE LLD)
 endif()
 
 # Two ISAs, no generic fallback:

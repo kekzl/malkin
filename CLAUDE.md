@@ -1,22 +1,43 @@
-# malkin
+# CLAUDE.md
 
-CPU LLM server: AVX-512 (VNNI, BF16) and Neoverse-N1+ (NEON dotprod) only. No generic fallback.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Layout
+malkin: GGUF LLM server (C++26, LLVM 23: clang + libc++ + libomp + lld, CMake 4.4) for exactly two CPU ISAs, AVX-512 (VNNI + BF16; Ryzen 9800X3D, EPYC 9634) and Armv8.2-A dotprod (Neoverse-N1+). No generic fallback, no other ISA.
 
-| Path | Role |
+## Commands
+
+Build and run only in Docker; the host has no compiler. Pass `--user $(id -u):$(id -g)` or build dirs end up root-owned.
+
+| Task | Command |
 |---|---|
-| `src/kernels.h` | ISA interface; one `.cpp` per ISA, picked by CMake from `CMAKE_SYSTEM_PROCESSOR` |
-| `src/quant.cpp` | GGUF block dequant (reference), dispatch, matmul tiling |
-| `src/model.cpp` | qwen3 forward, BF16 KV |
-| `src/engine.cpp` | worker thread, prefix cache, sampling loop, perplexity |
-| `src/server.cpp` | OpenAI + Anthropic HTTP |
+| Dev image | `docker build --target deps -t malkin-dev:local .` |
+| Build x86 | `docker run --rm --user $(id -u):$(id -g) -v $PWD:/src -w /src malkin-dev:local bash -c 'cmake -B build -G Ninja && cmake --build build'` |
+| Kernel test | `./build/test_quant` in the dev container (only ctest test: `ctest --test-dir build -R quant`; exit 77 = skipped, CPU lacks the ISA) |
+| Cross image | `docker buildx build --platform linux/arm64 --target deps --load -t malkin-cross:local .` (amd64 clang + arm64 libc++/libomp) |
+| Build arm64 | `cmake -B build-arm64 -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64-linux-gnu.cmake && cmake --build build-arm64` in `malkin-cross:local` |
+| Run arm64 | `qemu-aarch64 -cpu neoverse-n1 build-arm64/test_quant` (host has no binfmt; ctest uses the emulator via the toolchain file) |
+| CI-equivalent | `docker build --target test .` and `docker buildx build --platform linux/arm64 --target test .` |
+| Runtime image | `docker build -t malkin:local .` (arm64: `docker buildx build --platform linux/arm64 --load ...`) |
+| API test | start `malkin:local --model /models/<file>.gguf` with `-p 127.0.0.1:18080:8080`, then `tests/api_smoke.sh http://127.0.0.1:18080` (14 checks; host port 8080 belongs to imp) |
+| Correctness | `malkin ppl --model M -f /models/ppl_4k.txt --window 512` vs `docker run --rm -v /home/kekz/models:/models:ro ghcr.io/ggml-org/llama.cpp:full --perplexity -m M -f /models/ppl_4k.txt -c 512` |
+| Speed | `malkin bench --model M -pp 512 -tg 128` vs `llama.cpp:full` with `--entrypoint /app/llama-bench -p 512 -n 128 -t 8` |
+
+Models live in `/home/kekz/models` (mount read-only at `/models`). Reference model: `Qwen3-4B-Instruct-2507-Q8_0.gguf`, PPL 18.0120 (llama.cpp 18.0256).
+
+## Architecture
+
+Request path: `server.cpp` (httplib handler) -> `Engine::generate` (mutex, then `on_worker`) -> prefix match against `cache_` -> `Model::forward` in chunks of `kMaxBatch` = 256 -> `matmul` -> `kern::*`.
+
+- **One compute thread.** All model work runs on the engine worker thread so there is one OpenMP pool. OpenMP thread counts are per calling thread: a pool per HTTP thread ran decode at 7.2 instead of 13.2 tok/s. Decode uses physical cores, prefill (> 16 new tokens) all logical CPUs; `omp_set_num_threads` is set per phase in `engine.cpp`.
+- **ISA split.** `kernels.h` is the only ISA boundary; CMake picks `kernels_avx512.cpp` or `kernels_neon.cpp` from `CMAKE_SYSTEM_PROCESSOR`. Everything else is portable C++ (no intrinsics in `model.cpp`, `quant.cpp`). A new weight type needs: scalar `dequantize_row` (the reference), a dot kernel in both ISA files, dispatch in `vec_dot`, a case in `tests/test_quant.cpp`.
+- **Activations.** `BlockQ8` = 32 int8 + float scale + int16 sums of each 16-value half. The sums carry the K-quant min terms (Q4_K/Q5_K `dmin*m`) and the AVX-512 Q6_K `-32` bias, so kernels never sign-extend weights. llama.cpp uses Q8_K (256-value scale) for K-quants, so PPL vs llama.cpp differs by up to ~0.5 % there; Q8_0 and Q6_K match within 0.1 %.
+- **Weights** stay in the mmap'd GGUF (`Weight` is a view); load-time `prefetch` first-touches pages in parallel for NUMA spread. KV cache is BF16, `[layer][pos][kv_head*head_dim]`.
+- **Tokenization.** `ChatFormat::tokenize` encodes template parts with control tokens enabled and message content with them disabled, so user text cannot inject `<|im_end|>`. Only ChatML (Qwen) and only arch `qwen3` are supported; `read_config` rejects others.
+- **Streaming.** `Engine::generate` withholds incomplete UTF-8 and stop-string prefixes before calling `on_text`; `ReasoningSplitter` (server) splits `<think>` into `reasoning_content` / Anthropic `thinking` blocks and withholds partial tags.
+- **Image.** Build stages run on `$BUILDPLATFORM`; arm64 is cross-compiled (amd64 host only). The runtime stage must stay `COPY`-only (no `RUN`), so it builds without emulation; `docker/collect-libs.sh` copies libc++, libc++abi and libomp for the target arch, found via `LD_LIBRARY_PATH`. LLVM dev packages for amd64 and arm64 are not co-installable, so `docker/deps.sh` installs the target arch only.
 
 ## Rules
 
-- Build and test only in Docker: `docker compose --profile dev run --rm dev bash`, then `cmake -B build -G Ninja && cmake --build build`
-- arm64: `docker build --target cross-arm64 -t malkin-cross:local .`, toolchain `cmake/aarch64-linux-gnu.cmake`, run with `qemu-aarch64 -cpu neoverse-n1 -L /usr/aarch64-linux-gnu`
-- New kernel: both ISAs, plus a case in `tests/test_quant.cpp` against `dequantize_row`
-- Numeric change: perplexity vs `llama-perplexity` (`ghcr.io/ggml-org/llama.cpp:full`) on the same file and `-c`, both numbers in the PR
-- Perf claim: `malkin bench` vs `llama-bench`, same threads, numbers from the log
-- Compute only on the engine worker thread (one OpenMP pool)
+- Kernel or numeric change: both ISAs, `test_quant` green on both, PPL vs `llama-perplexity` on the same file and `-c` in the PR.
+- Perf claim: `malkin bench` vs `llama-bench` with the same threads on an idle host (check `/proc/loadavg`; other tenants like bookforge share this machine).
+- x86 build tuning must not favor one target (9800X3D Zen 5 vs EPYC 9634 Zen 4) without a measurement on both.

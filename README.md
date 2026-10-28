@@ -7,7 +7,7 @@
 | x86-64: AVX-512 + VNNI + BF16 | AMD Zen 4 / Zen 5 (Ryzen 7000/9000, EPYC 9004/9005), Intel Sapphire Rapids and newer | `src/kernels_avx512.cpp` |
 | aarch64: Armv8.2-A + dotprod + fp16 | Arm Neoverse-N1 and newer (Ampere Altra, Graviton2+) | `src/kernels_neon.cpp` |
 
-No generic fallback: on any other CPU malkin exits with the missing feature list. One container, OpenAI and Anthropic API, GGUF models, C++23, MIT.
+No generic fallback: on any other CPU malkin exits with the missing feature list. One container, OpenAI and Anthropic API, GGUF models, MIT. Toolchain: C++26, LLVM 23 (clang, lld, libc++, libomp), CMake 4.4, Ninja 1.13.
 
 ## Quick start
 
