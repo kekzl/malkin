@@ -38,11 +38,11 @@ Engine::Engine(const EngineOptions& o) {
   auto t0 = Clock::now();
   file_ = std::make_unique<GgufFile>(o.model_path);
   auto cfg = read_config(*file_);
-  // Decode is bandwidth-bound and loses with SMT (4B Q8_0, 9800X3D: 13.2 tok/s on 8 threads, 7.3 on 16);
-  // prefill is compute-bound and gains (42.5 -> 52.8 tok/s). OpenMP ICVs are per calling thread: set per phase.
+  // Physical cores for both phases (9800X3D, 4B Q8_0): decode 13.2 tok/s on 8 threads vs 7.3 on 16; panel-GEMM
+  // prefill 348.1 vs 188.7 (VNNI saturates a core; SMT siblings add barrier stragglers). ICVs are per thread.
   const int procs = omp_get_num_procs();
   threads_ = o.threads > 0 ? o.threads : std::min(cpu_physical_cores(), procs);
-  threads_batch_ = o.threads_batch > 0 ? o.threads_batch : procs;
+  threads_batch_ = o.threads_batch > 0 ? o.threads_batch : threads_;
   omp_set_num_threads(threads_);
 
   int n_ctx = o.n_ctx > 0 ? o.n_ctx : std::min(cfg.n_ctx_train, 32768);

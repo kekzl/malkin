@@ -176,3 +176,14 @@ void axpy_bf16(float a, const uint16_t* v, float* y, int n) {
 }
 
 }  // namespace malkin::kern
+
+namespace malkin::kern {
+
+// No NEON panel kernels yet: panel_bytes() == 0 keeps every weight on the row path.
+int panel_rows() { return 4; }
+size_t panel_bytes(GgmlType, int64_t, bool) { return 0; }
+void pack_panel(GgmlType, bool, const uint8_t*, size_t, int, int64_t, uint8_t*) {}
+int gemm_tile(GgmlType, bool) { return 1; }
+void gemm_panels(GgmlType, bool, const uint8_t*, size_t, int, int64_t, const BlockQ8*, int, float*, int64_t, int) {}
+
+}  // namespace malkin::kern

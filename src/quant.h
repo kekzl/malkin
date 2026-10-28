@@ -20,9 +20,27 @@ struct Weight {
   const uint8_t* data = nullptr;
   int64_t rows = 0, cols = 0;
   size_t row_bytes = 0;
+  // ISA panel layout (kern::panel_rows() rows interleaved), owned by the model; null = row path.
+  const uint8_t* packed = nullptr;
+  size_t panel_bytes = 0;
+  const uint8_t* wide = nullptr;  // wide panels for prefill (n > kWideMinTokens); null = use packed
+  size_t wide_bytes = 0;
   const uint8_t* row(int64_t r) const { return data + static_cast<size_t>(r) * row_bytes; }
   explicit operator bool() const { return data != nullptr; }
 };
+
+// Packs w into panels; the buffer is 2 MiB aligned for huge pages. Empty if the ISA has no panel kernel for w.type.
+struct PackedBuffer {
+  uint8_t* ptr = nullptr;
+  size_t size = 0;
+  PackedBuffer() = default;
+  PackedBuffer(PackedBuffer&& o) noexcept : ptr(o.ptr), size(o.size) { o.ptr = nullptr; }
+  PackedBuffer& operator=(PackedBuffer&&) = delete;
+  ~PackedBuffer();
+};
+PackedBuffer pack_weight(Weight& w, bool wide = false);
+// Token count above which matmul prefers wide panels.
+inline constexpr int kWideMinTokens = 16;
 
 bool weight_type_supported(GgmlType t);
 // True for types whose dot product runs on Q8 activations (otherwise on float activations).

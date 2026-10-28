@@ -21,7 +21,7 @@ endif()
 #   aarch64: Armv8.2-A + dotprod + fp16, Neoverse-N1 and newer
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
   set(MALKIN_ARCH_FLAGS -march=x86-64-v4 -mavx512vnni -mavx512bf16 -mtune=znver4)
-  set(MALKIN_KERNELS src/kernels_avx512.cpp)
+  set(MALKIN_KERNELS src/kernels_avx512.cpp src/gemm_avx512.cpp)
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
   set(MALKIN_ARCH_FLAGS -mcpu=neoverse-n1)
   set(MALKIN_KERNELS src/kernels_neon.cpp)

@@ -1,9 +1,12 @@
 #include "quant.h"
 
 #include <omp.h>
+#include <sys/mman.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
+#include <new>
 #include <stdexcept>
 #include <string>
 
@@ -162,7 +165,56 @@ void quantize_acts(const float* x, int n, int64_t k, std::vector<BlockQ8>& out) 
   for (int t = 0; t < n; ++t) kern::quantize_row_q8(x + t * k, o + t * nb, k);
 }
 
+PackedBuffer::~PackedBuffer() { std::free(ptr); }
+
+PackedBuffer pack_weight(Weight& w, bool wide) {
+  PackedBuffer b;
+  const size_t pb = kern::panel_bytes(w.type, w.cols, wide);
+  if (pb == 0) return b;
+  const int R = kern::panel_rows();
+  const int64_t panels = (w.rows + R - 1) / R;
+  constexpr size_t kHuge = 2u << 20;
+  b.size = (static_cast<size_t>(panels) * pb + kHuge - 1) / kHuge * kHuge;
+  b.ptr = static_cast<uint8_t*>(std::aligned_alloc(kHuge, b.size));
+  if (!b.ptr) throw std::bad_alloc();
+  madvise(b.ptr, b.size, MADV_HUGEPAGE);
+#pragma omp parallel for schedule(dynamic, 4)
+  for (int64_t p = 0; p < panels; ++p) {
+    const int rv = static_cast<int>(std::min<int64_t>(R, w.rows - p * R));
+    kern::pack_panel(w.type, wide, w.row(p * R), w.row_bytes, rv, w.cols, b.ptr + p * pb);
+  }
+  (wide ? w.wide : w.packed) = b.ptr;
+  (wide ? w.wide_bytes : w.panel_bytes) = pb;
+  return b;
+}
+
 void matmul(const Weight& w, const float* x, const BlockQ8* xq, int n, float* y) {
+  const bool wide = w.wide && n > kWideMinTokens;
+  if (wide || w.packed) {
+    // Work items: (panel pair, token tile); static order keeps a pair's tiles on one thread.
+    // Decode (n == 1) uses single panels: twice the items for the threads, no compute to share.
+    const uint8_t* base = wide ? w.wide : w.packed;
+    const size_t pb = wide ? w.wide_bytes : w.panel_bytes;
+    const int nt_max = kern::gemm_tile(w.type, wide);
+    const int R = kern::panel_rows();
+    const int np = n > 1 ? 2 : 1;
+    const int64_t panels = (w.rows + R - 1) / R;
+    const int64_t groups = (panels + np - 1) / np;
+    const int tiles = (n + nt_max - 1) / nt_max;
+    const int64_t nb = w.cols / 32;
+#pragma omp parallel for collapse(2) schedule(static)
+    for (int64_t g = 0; g < groups; ++g) {
+      for (int tt = 0; tt < tiles; ++tt) {
+        const int64_t p = g * np;
+        const int gp = static_cast<int>(std::min<int64_t>(np, panels - p));
+        const int t0 = tt * nt_max, nt = std::min(nt_max, n - t0);
+        const int rv = static_cast<int>(std::min<int64_t>(static_cast<int64_t>(gp) * R, w.rows - p * R));
+        kern::gemm_panels(w.type, wide, base + p * pb, pb, gp, w.cols, xq + t0 * nb, nt, y + t0 * w.rows + p * R,
+                          w.rows, rv);
+      }
+    }
+    return;
+  }
   // Tiles of up to 16 rows, at least 4 tiles per thread (1024 rows on 84 cores: tile 3).
   const int64_t threads = omp_get_max_threads();
   const int64_t tile_rows = std::clamp<int64_t>(w.rows / (threads * 4), 1, 16);

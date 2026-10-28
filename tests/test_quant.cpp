@@ -121,6 +121,49 @@ static bool check_bf16_helpers() {
   return ok;
 }
 
+// Panel GEMM vs row path: 19 rows (partial pair), 35 rows (pair + partial single), tokens across tile edges.
+static bool check_gemm(GgmlType t, int64_t k, int rows) {
+  if (kern::panel_bytes(t, k, false) == 0) return true;
+
+  std::vector<uint8_t> data;
+  for (int r = 0; r < rows; ++r) {
+    auto row = random_row(t, k);
+    data.insert(data.end(), row.begin(), row.end());
+  }
+  Weight w;
+  w.type = t;
+  w.data = data.data();
+  w.rows = rows;
+  w.cols = k;
+  w.row_bytes = ggml_row_size(t, k);
+  Weight wp = w;
+  PackedBuffer buf = pack_weight(wp);
+  PackedBuffer bufw = pack_weight(wp, true);  // n > kWideMinTokens takes these where the type has them
+  std::uniform_real_distribution<float> uf(-2.0f, 2.0f);
+  bool ok = true;
+  double worst = 0;
+  for (int n : {1, 3, 4, 6, 7, 11, 17, 23}) {
+    std::vector<float> x(n * k);
+    for (auto& v : x) v = uf(rng);
+    std::vector<BlockQ8> xq;
+    quantize_acts(x.data(), n, k, xq);
+    std::vector<float> y0(n * rows), y1(n * rows);
+    matmul(w, x.data(), xq.data(), n, y0.data());
+    matmul(wp, x.data(), xq.data(), n, y1.data());
+    double rms = 0;
+    for (float v : y0) rms += static_cast<double>(v) * v;
+    rms = std::sqrt(rms / y0.size());
+    for (int i = 0; i < n * rows; ++i) {
+      double err = std::fabs(y0[i] - y1[i]) / (rms + 1e-6);
+      worst = std::max(worst, err);
+      ok &= err < 1e-5;
+    }
+  }
+  std::printf("gemm %-5s k=%-5lld rows=%-3d worst rel err %.2e %s\n", ggml_type_name(t), static_cast<long long>(k), rows, worst,
+              ok ? "ok" : "FAIL");
+  return ok;
+}
+
 int main() {
   if (auto miss = cpu_missing_features(); !miss.empty()) {
     std::printf("skip: CPU lacks %s\n", miss.c_str());
@@ -133,5 +176,6 @@ int main() {
   }
   ok &= check(GgmlType::Q8_0, 96);  // odd block count: 256-bit tail
   ok &= check(GgmlType::F32, 100);  // scalar tail
+  for (auto t : {GgmlType::Q8_0, GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K}) ok &= check_gemm(t, 512, 19) && check_gemm(t, 512, 35);
   return ok ? 0 : 1;
 }
