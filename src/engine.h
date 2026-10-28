@@ -20,7 +20,7 @@ struct EngineOptions {
   std::string model_path;
   int n_ctx = 0;  // 0: auto
   int threads = 0;        // decode; 0: physical cores
-  int threads_batch = 0;  // prefill; 0: all logical CPUs
+  int threads_batch = 0;  // prefill; 0: same as threads
 };
 
 struct GenRequest {

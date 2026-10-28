@@ -54,6 +54,7 @@ class Model {
   // Scratch for up to kMaxBatch tokens.
   std::vector<float> x_, h_, q_, k_, v_, att_, gate_, up_, rope_cos_, rope_sin_;
   std::vector<BlockQ8> xq_;
+  std::vector<PackedBuffer> packs_;  // panel copies of the matmul weights
 };
 
 }  // namespace malkin

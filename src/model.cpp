@@ -3,7 +3,10 @@
 #include <omp.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -43,6 +46,29 @@ void rmsnorm(float* y, const float* x, const float* w, int n, float eps) {
   const float s = 1.0f / std::sqrt(kern::dot_f32(n, x, x) / n + eps);
   for (int i = 0; i < n; ++i) y[i] = x[i] * s * w[i];
 }
+
+// MALKIN_PROFILE=1: wall time per forward stage, printed at exit.
+struct Prof {
+  bool on = std::getenv("MALKIN_PROFILE") != nullptr;
+  double ms[7] = {};
+  ~Prof() {
+    if (!on) return;
+    static const char* names[7] = {"norm+qkv", "qk-norm/rope/kv", "attention", "wo+res+norm", "gate+up", "silu+down", "output"};
+    double total = 0;
+    for (double v : ms) total += v;
+    for (int i = 0; i < 7; ++i) std::fprintf(stderr, "profile %-16s %9.1f ms %5.1f %%\n", names[i], ms[i], 100 * ms[i] / total);
+  }
+} g_prof;
+
+struct Lap {
+  std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
+  void operator()(int i) {
+    if (!g_prof.on) return;
+    auto now = std::chrono::steady_clock::now();
+    g_prof.ms[i] += std::chrono::duration<double, std::milli>(now - t).count();
+    t = now;
+  }
+};
 
 }  // namespace
 
@@ -98,6 +124,18 @@ Model::Model(const GgufFile& f, int n_ctx) : cfg_(read_config(f)), n_ctx_(n_ctx)
     l.w_up = weight(f, p + "ffn_up.weight");
     l.w_down = weight(f, p + "ffn_down.weight");
     layers_.push_back(l);
+  }
+  // MALKIN_NO_PACK: row path only. MALKIN_NO_WIDE: no wide prefill panels (saves ~1 byte per K-quant weight).
+  if (!std::getenv("MALKIN_NO_PACK")) {
+    const bool wide = !std::getenv("MALKIN_NO_WIDE");
+    for (auto& l : layers_) {
+      for (Weight* w : {&l.wq, &l.wk, &l.wv, &l.wo, &l.w_gate, &l.w_up, &l.w_down}) {
+        packs_.push_back(pack_weight(*w));
+        if (wide) packs_.push_back(pack_weight(*w, true));
+      }
+    }
+    packs_.push_back(pack_weight(output_));
+    if (wide) packs_.push_back(pack_weight(output_, true));
   }
   for (int i = 0; i < c.head_dim / 2; ++i) inv_freq_.push_back(std::pow(c.rope_base, -2.0f * i / c.head_dim));
 
@@ -185,6 +223,7 @@ void Model::forward(const int32_t* tokens, int n, int pos, float* logits, bool a
     }
   };
 
+  Lap lap;
   for (int il = 0; il < c.n_layer; ++il) {
     const Layer& L = layers_[il];
 #pragma omp parallel for schedule(static) if (n > 1)
@@ -193,6 +232,7 @@ void Model::forward(const int32_t* tokens, int n, int pos, float* logits, bool a
     matmul(L.wq, h_.data(), xq_.data(), n, q_.data());
     matmul(L.wk, h_.data(), xq_.data(), n, k_.data());
     matmul(L.wv, h_.data(), xq_.data(), n, v_.data());
+    lap(0);
 
     uint16_t* kc = kcache_.data() + (static_cast<size_t>(il) * n_ctx_ + pos) * kv_row;
     uint16_t* vc = vcache_.data() + (static_cast<size_t>(il) * n_ctx_ + pos) * kv_row;
@@ -214,9 +254,12 @@ void Model::forward(const int32_t* tokens, int n, int pos, float* logits, bool a
       }
     }
 
+    lap(1);
     attention(il, n, pos);
+    lap(2);
     quantize_acts(att_.data(), n, static_cast<int64_t>(H) * D, xq_);
     matmul(L.wo, att_.data(), xq_.data(), n, h_.data());
+    lap(3);
     for (size_t i = 0; i < static_cast<size_t>(n) * E; ++i) x_[i] += h_[i];
 
 #pragma omp parallel for schedule(static) if (n > 1)
@@ -224,6 +267,7 @@ void Model::forward(const int32_t* tokens, int n, int pos, float* logits, bool a
     quantize_acts(h_.data(), n, E, xq_);
     matmul(L.w_gate, h_.data(), xq_.data(), n, gate_.data());
     matmul(L.w_up, h_.data(), xq_.data(), n, up_.data());
+    lap(4);
     const size_t nf = static_cast<size_t>(n) * F;
 #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < nf; ++i) {
@@ -232,6 +276,7 @@ void Model::forward(const int32_t* tokens, int n, int pos, float* logits, bool a
     }
     quantize_acts(gate_.data(), n, F, xq_);
     matmul(L.w_down, gate_.data(), xq_.data(), n, h_.data());
+    lap(5);
     for (size_t i = 0; i < static_cast<size_t>(n) * E; ++i) x_[i] += h_[i];
   }
 
@@ -240,6 +285,7 @@ void Model::forward(const int32_t* tokens, int n, int pos, float* logits, bool a
   for (int t = first; t < n; ++t) rmsnorm(h_.data() + (t - first) * E, x_.data() + t * E, output_norm_, E, c.rms_eps);
   quantize_acts(h_.data(), m, E, xq_);
   matmul(output_, h_.data(), xq_.data(), m, logits);
+  lap(6);
 }
 
 }  // namespace malkin

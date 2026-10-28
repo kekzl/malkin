@@ -29,7 +29,7 @@ options:
   --port N          listen port (default 8080)
   --ctx N           context length (default: auto from RAM, max 32768)
   --threads N       decode threads (default: physical cores)
-  --threads-batch N prefill threads (default: all logical CPUs)
+  --threads-batch N prefill threads (default: same as --threads)
   -p TEXT           prompt (run)
   -n N              max new tokens (run, default 512)
   --temp F          temperature (run, default 0 = greedy)
