@@ -157,39 +157,22 @@ Model::Model(const GgufFile& f, int n_ctx) : cfg_(read_config(f)), n_ctx_(n_ctx)
 
 void Model::attention(int il, int n, int pos) {
   const auto& c = cfg_;
-  const int D = c.head_dim, H = c.n_head, G = c.n_head / c.n_head_kv;
-  const size_t kv_row = static_cast<size_t>(c.n_head_kv) * D;
+  const int D = c.head_dim, H = c.n_head, KV = c.n_head_kv, G = H / KV;
+  const size_t kv_row = static_cast<size_t>(KV) * D;
   const uint16_t* kc = kcache_.data() + static_cast<size_t>(il) * n_ctx_ * kv_row;
   const uint16_t* vc = vcache_.data() + static_cast<size_t>(il) * n_ctx_ * kv_row;
   const float scale = 1.0f / std::sqrt(static_cast<float>(D));
+  // Work items: (token, KV head); the G query heads of a KV head share every K/V row load.
 #pragma omp parallel
   {
-    thread_local std::vector<float> scores;
-    thread_local std::vector<float> acc;
-    if (scores.size() < static_cast<size_t>(n_ctx_)) scores.resize(n_ctx_);
-    if (acc.size() < static_cast<size_t>(D)) acc.resize(D);
+    thread_local std::vector<float> scratch;
+    if (scratch.size() < static_cast<size_t>(G) * n_ctx_) scratch.resize(static_cast<size_t>(G) * n_ctx_);
 #pragma omp for collapse(2) schedule(dynamic, 1)
     for (int t = 0; t < n; ++t) {
-      for (int h = 0; h < H; ++h) {
-        const int p_end = pos + t + 1;
-        const float* q = q_.data() + (static_cast<size_t>(t) * H + h) * D;
-        const size_t koff = static_cast<size_t>(h / G) * D;
-        float mx = -INFINITY;
-        for (int j = 0; j < p_end; ++j) {
-          float sc = kern::dot_f32_bf16(q, kc + j * kv_row + koff, D) * scale;
-          scores[j] = sc;
-          mx = std::max(mx, sc);
-        }
-        float sum = 0.0f;
-        for (int j = 0; j < p_end; ++j) {
-          scores[j] = std::exp(scores[j] - mx);
-          sum += scores[j];
-        }
-        std::fill(acc.begin(), acc.begin() + D, 0.0f);
-        for (int j = 0; j < p_end; ++j) kern::axpy_bf16(scores[j], vc + j * kv_row + koff, acc.data(), D);
-        float* out = att_.data() + (static_cast<size_t>(t) * H + h) * D;
-        const float inv = 1.0f / sum;
-        for (int d = 0; d < D; ++d) out[d] = acc[d] * inv;
+      for (int g = 0; g < KV; ++g) {
+        const size_t qoff = (static_cast<size_t>(t) * H + static_cast<size_t>(g) * G) * D;
+        kern::attend_gqa(q_.data() + qoff, G, D, kc + static_cast<size_t>(g) * D, vc + static_cast<size_t>(g) * D, kv_row,
+                         pos + t + 1, scale, att_.data() + qoff, scratch.data());
       }
     }
   }

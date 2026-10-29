@@ -21,6 +21,8 @@ struct EngineOptions {
   int n_ctx = 0;  // 0: auto
   int threads = 0;        // decode; 0: physical cores
   int threads_batch = 0;  // prefill; 0: same as threads
+  std::string draft_path;  // speculative decoding draft model (same tokenizer); empty: off
+  int n_draft = 0;         // max draft tokens per step; 0: default 8 (adaptive below it)
 };
 
 struct GenRequest {
@@ -35,6 +37,7 @@ struct GenResult {
   std::string finish_reason;  // stop | length | cancelled
   int prompt_tokens = 0, cached_tokens = 0, completion_tokens = 0;
   double prefill_ms = 0, decode_ms = 0;
+  int drafted = 0, accepted = 0;  // speculative decoding: draft tokens proposed / accepted
 };
 
 // Text delta callback; return false to cancel.
@@ -75,6 +78,8 @@ class Engine {
   GenResult generate_locked(const GenRequest& req, const OnText& on_text);
   double perplexity_locked(const std::string& text, int window, int* scored);
   void prefill(const std::vector<int32_t>& toks, size_t from, float* logits);
+  // Bring the draft KV to ctx (common prefix reuse); its logits then predict the token after ctx.
+  void draft_sync(const std::vector<int32_t>& ctx);
 
   std::mutex qmu_;
   std::condition_variable qcv_;
@@ -88,6 +93,11 @@ class Engine {
   std::unique_ptr<Model> model_;
   std::vector<int32_t> cache_;  // tokens whose KV is valid at positions 0..size-1
   std::vector<float> logits_;
+  std::unique_ptr<GgufFile> dfile_;
+  std::unique_ptr<Model> draft_;
+  std::vector<int32_t> dcache_;
+  std::vector<float> dlogits_, vlogits_;
+  int n_draft_ = 8;
   std::mutex mu_;
   int threads_ = 0, threads_batch_ = 0;
   std::string model_id_;
