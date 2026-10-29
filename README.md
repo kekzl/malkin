@@ -74,6 +74,7 @@ Four prompt types (explanation, code, list, summary), 200 greedy tokens each. ll
 - **Two ISAs.** No AVX2-only x86, no Apple, no SVE paths yet (Neoverse-V1/V2 run the N1 kernels).
 - **Q6_K prompt reading** is 1.44x llama.cpp, not 2x: its scale per 16 weights needs a float multiply per 4 `vpdpbusd` on the same ports (one core: 0.43 TMAC/s, 0.51 in an ablation build without scales).
 - **Answers without a draft model** are level with llama.cpp: memory bandwidth, not compute, sets the pace. llama.cpp can run a draft model too; the tables compare both engines on their defaults.
+- **RAM.** Packed panels are copies of the weights, so K-quant models take about 3x the GGUF size: Qwen3-1.7B Q4_K_M (1223 MiB file) peaks at 3912 MiB anonymous RSS with ctx 4096, 1788 MiB with `MALKIN_NO_WIDE=1` (slower prompt reading). The auto context fills half of what remains.
 - **One architecture:** Qwen3 dense (`qwen3`). No MoE, no vision, no tool calls yet.
 - **Neoverse numbers are emulated** (`qemu -cpu neoverse-n1`): correct, not benchmarked on hardware.
 

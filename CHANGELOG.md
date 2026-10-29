@@ -6,6 +6,7 @@
 - Vectorized SiLU (`kern::silu_mul`), threaded residual adds.
 - Continuous batching: `serve --parallel N` (default 4) decodes concurrent requests in one forward pass per step, one KV sequence per slot with prefix reuse; 4B Q8_0 with 8 requests 100.07 tok/s vs llama-server 58.01. `tools/bench_parallel.sh`, `tools/check_parallel.sh`.
 - Speculative decoding for concurrent requests: draft proposals and tree verification batched across slots; Qwen3-8B Q8_0 + 0.6B draft, 4 requests 50.17 tok/s vs llama-server 23.42, 8 requests 73.06 vs 37.66.
+- Auto context size measures free RAM after the packed weights are resident, counts the draft KV, and honors cgroup v2 limits (`docker --memory`, systemd `MemoryMax`). Before, Qwen3-1.7B Q4_K_M + 0.6B draft under `docker --memory 6g` picked ctx 32768 and was OOM-killed; now ctx 2464.
 - `bench_layers`: decode (n = 1) bandwidth over distinct packed weights larger than L3; Q8_0, Q4_K, Q6_K reach 59-61 GB/s on the 9800X3D.
 
 | pp512 tok/s, 9800X3D, 8 threads, best of 3 interleaved, host load 7-9 | 0.1.0 | now | llama.cpp |

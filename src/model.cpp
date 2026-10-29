@@ -142,9 +142,8 @@ Model::Model(const GgufFile& f, int n_ctx, int n_seq) : cfg_(read_config(f)), n_
   }
   for (int i = 0; i < c.head_dim / 2; ++i) inv_freq_.push_back(std::pow(c.rope_base, -2.0f * i / c.head_dim));
 
+  if (n_ctx > 0) alloc_kv(n_ctx);
   const size_t kv_row = static_cast<size_t>(c.n_head_kv) * c.head_dim;
-  kcache_.assign(static_cast<size_t>(c.n_layer) * n_seq * n_ctx * kv_row, 0);
-  vcache_.assign(kcache_.size(), 0);
   const size_t B = kMaxBatch;
   x_.resize(B * c.n_embd);
   h_.resize(B * c.n_embd);
@@ -156,6 +155,14 @@ Model::Model(const GgufFile& f, int n_ctx, int n_seq) : cfg_(read_config(f)), n_
   up_.resize(B * c.n_ff);
   rope_cos_.resize(B * c.head_dim / 2);
   rope_sin_.resize(rope_cos_.size());
+}
+
+void Model::alloc_kv(int n_ctx) {
+  const auto& c = cfg_;
+  n_ctx_ = n_ctx;
+  const size_t kv_row = static_cast<size_t>(c.n_head_kv) * c.head_dim;
+  kcache_.assign(static_cast<size_t>(c.n_layer) * n_seq_ * n_ctx * kv_row, 0);
+  vcache_.assign(kcache_.size(), 0);
 }
 
 void Model::attention(int il, int n) {
