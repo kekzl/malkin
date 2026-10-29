@@ -218,12 +218,13 @@ float softmax_inplace(float* s, int n) {
 }
 
 template <int DC>
-void attend_t(const float* q, int G, const uint16_t* k, const uint16_t* v, size_t stride, int n, float scale, float* out,
-              float* sc) {
+void attend_t(const float* q, int G, const uint16_t* k, const uint16_t* v, size_t stride, int n0, const int* extra, int ne,
+              float scale, float* out, float* sc) {
   constexpr int D = DC * 16;
   constexpr int HP = DC <= 8 ? 2 : 1;  // heads per PV pass: HP x DC accumulators stay in registers
+  const int n = n0 + ne;  // keys 0..n0-1, then extra[]
   for (int j = 0; j < n; ++j) {
-    const uint16_t* kr = k + j * stride;
+    const uint16_t* kr = k + static_cast<size_t>(j < n0 ? j : extra[j - n0]) * stride;
     __m512 kf[DC];
     for (int d = 0; d < DC; ++d) kf[d] = load_bf16(kr + 16 * d);
     for (int h = 0; h < G; ++h) {
@@ -240,7 +241,7 @@ void attend_t(const float* q, int G, const uint16_t* k, const uint16_t* v, size_
     for (int hh = 0; hh < HP; ++hh)
       for (int d = 0; d < DC; ++d) acc[hh][d] = _mm512_setzero_ps();
     for (int j = 0; j < n; ++j) {
-      const uint16_t* vr = v + j * stride;
+      const uint16_t* vr = v + static_cast<size_t>(j < n0 ? j : extra[j - n0]) * stride;
       __m512 pj[HP];
       for (int hh = 0; hh < HP; ++hh) pj[hh] = _mm512_set1_ps(hh < hp ? sc[(h0 + hh) * n + j] : 0.0f);
       for (int d = 0; d < DC; ++d) {
@@ -258,22 +259,24 @@ void attend_t(const float* q, int G, const uint16_t* k, const uint16_t* v, size_
 }  // namespace
 
 void attend_gqa(const float* q, int G, int D, const uint16_t* k, const uint16_t* v, size_t stride, int n, float scale,
-                float* out, float* scratch) {
+                float* out, float* scratch, const int* extra, int ne) {
   if (G <= 16) {
     switch (D) {
-      case 64: return attend_t<4>(q, G, k, v, stride, n, scale, out, scratch);
-      case 128: return attend_t<8>(q, G, k, v, stride, n, scale, out, scratch);
-      case 256: return attend_t<16>(q, G, k, v, stride, n, scale, out, scratch);
+      case 64: return attend_t<4>(q, G, k, v, stride, n, extra, ne, scale, out, scratch);
+      case 128: return attend_t<8>(q, G, k, v, stride, n, extra, ne, scale, out, scratch);
+      case 256: return attend_t<16>(q, G, k, v, stride, n, extra, ne, scale, out, scratch);
       default: break;
     }
   }
+  const int nk = n + ne;
+  auto key = [&](int j) { return static_cast<size_t>(j < n ? j : extra[j - n]) * stride; };
   for (int h = 0; h < G; ++h) {  // other head sizes: one head at a time
-    float* s = scratch + static_cast<size_t>(h) * n;
-    for (int j = 0; j < n; ++j) s[j] = dot_f32_bf16(q + h * D, k + j * stride, D) * scale;
-    const float iv = softmax_inplace(s, n);
+    float* s = scratch + static_cast<size_t>(h) * nk;
+    for (int j = 0; j < nk; ++j) s[j] = dot_f32_bf16(q + h * D, k + key(j), D) * scale;
+    const float iv = softmax_inplace(s, nk);
     float* o = out + h * D;
     for (int d = 0; d < D; ++d) o[d] = 0.0f;
-    for (int j = 0; j < n; ++j) axpy_bf16(s[j] * iv, v + j * stride, o, D);
+    for (int j = 0; j < nk; ++j) axpy_bf16(s[j] * iv, v + key(j), o, D);
   }
 }
 

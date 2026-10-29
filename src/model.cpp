@@ -171,14 +171,29 @@ void Model::attention(int il, int n, int pos) {
     for (int t = 0; t < n; ++t) {
       for (int g = 0; g < KV; ++g) {
         const size_t qoff = (static_cast<size_t>(t) * H + static_cast<size_t>(g) * G) * D;
+        const bool tree = !anc_off_.empty();
         kern::attend_gqa(q_.data() + qoff, G, D, kc + static_cast<size_t>(g) * D, vc + static_cast<size_t>(g) * D, kv_row,
-                         pos + t + 1, scale, att_.data() + qoff, scratch.data());
+                         tree ? pos : pos + t + 1, scale, att_.data() + qoff, scratch.data(),
+                         tree ? anc_.data() + anc_off_[t] : nullptr, tree ? anc_off_[t + 1] - anc_off_[t] : 0);
       }
     }
   }
 }
 
-void Model::forward(const int32_t* tokens, int n, int pos, float* logits, bool all_logits) {
+void Model::forward(const int32_t* tokens, int n, int pos, float* logits, bool all_logits, const int* parent) {
+  depth_.clear();
+  anc_.clear();
+  anc_off_.clear();
+  if (parent) {  // tree: depth and ancestor KV positions (self included) per token
+    depth_.resize(n);
+    for (int t = 0; t < n; ++t) {
+      depth_[t] = parent[t] < 0 ? 0 : depth_[parent[t]] + 1;
+      anc_off_.push_back(static_cast<int>(anc_.size()));
+      for (int a = t; a >= 0; a = parent[a]) anc_.push_back(pos + a);
+      std::reverse(anc_.begin() + anc_off_.back(), anc_.end());  // root first: same key order as plain decode
+    }
+    anc_off_.push_back(static_cast<int>(anc_.size()));
+  }
   const auto& c = cfg_;
   if (n <= 0 || n > kMaxBatch) throw std::runtime_error("forward: batch size out of range");
   if (pos + n > n_ctx_) throw std::runtime_error("forward: context full");
@@ -191,7 +206,7 @@ void Model::forward(const int32_t* tokens, int n, int pos, float* logits, bool a
   }
   for (int t = 0; t < n; ++t) {
     for (int i = 0; i < D / 2; ++i) {
-      float a = static_cast<float>(pos + t) * inv_freq_[i];
+      float a = static_cast<float>(pos + (anc_off_.empty() ? t : depth_[t])) * inv_freq_[i];
       rope_cos_[t * D / 2 + i] = std::cos(a);
       rope_sin_[t * D / 2 + i] = std::sin(a);
     }
@@ -269,6 +284,20 @@ void Model::forward(const int32_t* tokens, int n, int pos, float* logits, bool a
   quantize_acts(h_.data(), m, E, xq_);
   matmul(output_, h_.data(), xq_.data(), m, logits);
   lap(6);
+}
+
+}  // namespace malkin
+
+namespace malkin {
+
+void Model::move_kv(int from, int to) {
+  if (from == to) return;
+  const size_t row = static_cast<size_t>(cfg_.n_head_kv) * cfg_.head_dim;
+  for (int il = 0; il < cfg_.n_layer; ++il) {
+    const size_t base = static_cast<size_t>(il) * n_ctx_;
+    std::memcpy(kcache_.data() + (base + to) * row, kcache_.data() + (base + from) * row, row * sizeof(uint16_t));
+    std::memcpy(vcache_.data() + (base + to) * row, vcache_.data() + (base + from) * row, row * sizeof(uint16_t));
+  }
 }
 
 }  // namespace malkin

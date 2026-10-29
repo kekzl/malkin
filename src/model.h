@@ -30,7 +30,12 @@ class Model {
 
   // Evaluate n tokens at positions pos..pos+n-1 (n <= kMaxBatch); KV for those positions is overwritten.
   // logits: n_vocab floats for the last token, or n * n_vocab when all_logits.
-  void forward(const int32_t* tokens, int n, int pos, float* logits, bool all_logits);
+  // parent (optional, tree verification): batch index of each token's parent, -1 = the token after the prefix;
+  // parents precede children. Token t then sits at RoPE position pos + depth(t), KV slot pos + t, and attends to
+  // the prefix plus its ancestors.
+  void forward(const int32_t* tokens, int n, int pos, float* logits, bool all_logits, const int* parent = nullptr);
+  // Copy the KV rows of position from to position to (all layers): compacts an accepted tree path.
+  void move_kv(int from, int to);
 
  private:
   struct Layer {
@@ -42,6 +47,7 @@ class Model {
   };
 
   void attention(int il, int n, int pos);
+  std::vector<int> depth_, anc_, anc_off_;  // tree mode: per-token depth, flattened ancestor KV positions
 
   ModelConfig cfg_;
   int n_ctx_;
