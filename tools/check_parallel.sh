@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Greedy answers of N concurrent requests must equal the same requests one at a time (batching is lossless).
-# usage: tools/check_parallel.sh URL [N=4] [MAX_TOKENS=64]
+# usage: tools/check_parallel.sh URL [N=4] [MAX_TOKENS=64]; OUT=dir keeps the answers (compare two servers with diff -r)
 set -euo pipefail
 URL=$1; N=${2:-4}; MAXT=${3:-64}
 topics=("the printing press" "loop unrolling" "the water cycle" "chess openings" "vaccines" "solar power"
@@ -20,4 +20,5 @@ for i in $(seq 0 $((N - 1))); do
   if cmp -s "$tmp/par$i" "$tmp/seq$i"; then echo "request $i: same ($(wc -c < "$tmp/seq$i") bytes)"; else
     echo "request $i: DIFFERENT"; diff <(fold -w 80 "$tmp/par$i") <(fold -w 80 "$tmp/seq$i") | head -6; fail=1; fi
 done
+if [ -n "${OUT:-}" ]; then mkdir -p "$OUT"; cp "$tmp"/seq* "$OUT"/; fi
 exit $fail

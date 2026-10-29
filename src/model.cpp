@@ -225,15 +225,36 @@ void Model::forward(const BatchToken* batch, int n, float* logits) {
   kv_base_.resize(n);
   n_keys_.resize(n);
   out_.clear();
+  bool tree = false;
   for (int t = 0; t < n; ++t) {
     const BatchToken& b = batch[t];
-    if (b.seq < 0 || b.seq >= n_seq_ || b.pos < 0 || b.pos >= n_ctx_) throw std::runtime_error("forward: bad slot");
+    const int kv = b.parent < 0 ? b.pos : b.kv;
+    if (b.seq < 0 || b.seq >= n_seq_ || b.pos < 0 || b.pos >= n_ctx_ || kv < 0 || kv >= n_ctx_)
+      throw std::runtime_error("forward: bad slot");
+    if (b.parent >= t || (b.parent >= 0 && batch[b.parent].seq != b.seq))
+      throw std::runtime_error("forward: bad tree parent");
     ids_[t] = b.id;
     rpos_[t] = b.pos;
     kv_base_[t] = b.seq * n_ctx_;
-    kv_at_[t] = kv_base_[t] + b.pos;
-    n_keys_[t] = b.pos + 1;
+    kv_at_[t] = kv_base_[t] + kv;
+    tree = tree || b.parent >= 0;
     if (b.logits) out_.push_back(t);
+  }
+  // Keys: plain tokens 0..pos; tree tokens the parent's keys (contiguous part, then extra rows) plus their own row.
+  if (tree) anc_off_.push_back(0);
+  for (int t = 0; t < n; ++t) {
+    const BatchToken& b = batch[t];
+    if (b.parent < 0) {
+      n_keys_[t] = b.pos + 1;
+    } else {
+      n_keys_[t] = n_keys_[b.parent];
+      for (int i = anc_off_[b.parent]; i < anc_off_[b.parent + 1]; ++i) {
+        const int row = anc_[i];  // copy: push_back may reallocate
+        anc_.push_back(row);
+      }
+      anc_.push_back(kv_at_[t] - kv_base_[t]);
+    }
+    if (tree) anc_off_.push_back(static_cast<int>(anc_.size()));
   }
   run(ids_.data(), n, logits);
 }

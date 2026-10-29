@@ -19,11 +19,14 @@ ModelConfig read_config(const GgufFile& f);
 // KV cache bytes per token position (BF16 K and V, all layers).
 size_t kv_bytes_per_token(const ModelConfig& c);
 
-// One token of a multi-sequence batch: KV row seq * n_ctx + pos, attends to positions 0..pos of its sequence.
+// One token of a multi-sequence batch. Plain (parent < 0): RoPE position and KV row pos, attends to positions
+// 0..pos of its sequence. Tree (parent = batch index of a token of the same sequence): KV row kv, attends to the
+// keys of its parent plus itself, in that order (same key order as plain decode of the accepted path).
 struct BatchToken {
   int32_t id;
   int seq, pos;
   bool logits;  // write n_vocab logits for this token
+  int kv = -1, parent = -1;
 };
 
 // Qwen3 dense decoder over n_seq sequences of n_ctx positions each, BF16 KV cache.
