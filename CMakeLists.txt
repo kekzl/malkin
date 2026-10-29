@@ -74,5 +74,7 @@ set_tests_properties(quant PROPERTIES SKIP_RETURN_CODE 77)
 add_executable(test_sampler tests/test_sampler.cpp)
 target_link_libraries(test_sampler PRIVATE malkin_core)
 add_test(NAME sampler COMMAND test_sampler)
+add_executable(bench_gemm tests/bench_gemm.cpp)
+target_link_libraries(bench_gemm PRIVATE malkin_core)
 
 install(TARGETS malkin RUNTIME DESTINATION bin)

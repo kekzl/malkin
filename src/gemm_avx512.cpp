@@ -15,7 +15,10 @@ namespace {
 constexpr int R = 16;
 
 // Panel sizes per 32 (Q8_0) or 256 (K-quants) columns.
-constexpr size_t kQ8_0Block = 32 + 8 * 64;               // 16 fp16 scales + 8 groups x 64 bytes (w + 128)
+// Q8_0 block pairs, 64-byte aligned: 2 x 16 fp16 scales, then 2 x 8 groups x 64 bytes (w + 128).
+constexpr size_t kQ8_0Pair = 64 + 2 * 8 * 64;
+inline const uint8_t* q8_scales(const uint8_t* p, int64_t b) { return p + (b / 2) * kQ8_0Pair + 32 * (b & 1); }
+inline const uint8_t* q8_weights(const uint8_t* p, int64_t b) { return p + (b / 2) * kQ8_0Pair + 64 + 512 * (b & 1); }
 constexpr size_t kQ4KBlock = 64 + 256 + 64 * 32;          // d/dmin, per-sub-block sc/m, 64 nibble groups
 constexpr size_t kQ5KBlock = kQ4KBlock + 64 * 8;          // + bit-4 mask per group
 constexpr size_t kQ6KBlock = 32 + 256 + 64 * 32 + 64 * 16;  // d, int8 scale per 16, nibbles, bit-4/5 masks
@@ -71,15 +74,15 @@ void k_q8_0(const uint8_t* p, size_t pb, int64_t cols, const BlockQ8* x, float* 
     const uint8_t* pq[NP];
     __m512 dw[NP];
     for (int q = 0; q < NP; ++q) {
-      pq[q] = p + q * pb + b * kQ8_0Block;
-      dw[q] = _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(pq[q])));
+      pq[q] = q8_weights(p + q * pb, b);
+      dw[q] = _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(q8_scales(p + q * pb, b))));
     }
     __m512i ai[NP][NT];
     for (int q = 0; q < NP; ++q)
       for (int t = 0; t < NT; ++t) ai[q][t] = _mm512_setzero_si512();
     for (int g = 0; g < 8; ++g) {
       __m512i w[NP];
-      for (int q = 0; q < NP; ++q) w[q] = _mm512_loadu_si512(pq[q] + 32 + 64 * g);
+      for (int q = 0; q < NP; ++q) w[q] = _mm512_loadu_si512(pq[q] + 64 * g);
       for (int t = 0; t < NT; ++t) {
         const __m512i xv = _mm512_set1_epi32(ld32(x[t * nb + b].qs + 4 * g));
         for (int q = 0; q < NP; ++q) ai[q][t] = _mm512_dpbusd_epi32(ai[q][t], w[q], xv);
@@ -342,13 +345,14 @@ void dispatch(GgmlType t, bool wide, const uint8_t* p, size_t pb, int64_t cols, 
 
 void pack_q8_0(const uint8_t* src, size_t ss, int rv, int64_t cols, uint8_t* dst) {
   for (int64_t b = 0; b < cols / 32; ++b) {
-    uint8_t* pb = dst + b * kQ8_0Block;
-    std::memset(pb, 0, 32);
-    std::memset(pb + 32, 0x80, 8 * 64);
+    uint8_t* ps = const_cast<uint8_t*>(q8_scales(dst, b));
+    uint8_t* pw = const_cast<uint8_t*>(q8_weights(dst, b));
+    std::memset(ps, 0, 32);
+    std::memset(pw, 0x80, 8 * 64);
     for (int r = 0; r < rv; ++r) {
       const uint8_t* s = src + r * ss + b * 34;
-      std::memcpy(pb + 2 * r, s, 2);
-      for (int k = 0; k < 32; ++k) pb[32 + (k / 4) * 64 + 4 * r + k % 4] = s[2 + k] ^ 0x80;
+      std::memcpy(ps + 2 * r, s, 2);
+      for (int k = 0; k < 32; ++k) pw[(k / 4) * 64 + 4 * r + k % 4] = s[2 + k] ^ 0x80;
     }
   }
 }
@@ -468,7 +472,7 @@ int panel_rows() { return R; }
 size_t panel_bytes(GgmlType t, int64_t cols, bool wide) {
   const auto sb = static_cast<size_t>(cols / 256);
   switch (t) {
-    case GgmlType::Q8_0: return wide ? 0 : static_cast<size_t>(cols / 32) * kQ8_0Block;
+    case GgmlType::Q8_0: return wide ? 0 : static_cast<size_t>((cols / 32 + 1) / 2) * kQ8_0Pair;
     case GgmlType::Q4_K: return sb * (wide ? kQ45WBlock : kQ4KBlock);
     case GgmlType::Q5_K: return sb * (wide ? kQ45WBlock : kQ5KBlock);
     case GgmlType::Q6_K: return sb * (wide ? kQ6WBlock : kQ6KBlock);

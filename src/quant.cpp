@@ -200,15 +200,23 @@ void matmul(const Weight& w, const float* x, const BlockQ8* xq, int n, float* y)
     const int np = n > 1 ? 2 : 1;
     const int64_t panels = (w.rows + R - 1) / R;
     const int64_t groups = (panels + np - 1) / np;
-    const int tiles = (n + nt_max - 1) / nt_max;
     const int64_t nb = w.cols / 32;
-#pragma omp parallel for collapse(2) schedule(static)
-    for (int64_t g = 0; g < groups; ++g) {
-      for (int tt = 0; tt < tiles; ++tt) {
-        const int64_t p = g * np;
-        const int gp = static_cast<int>(std::min<int64_t>(np, panels - p));
+    // Work item: one panel group x one token chunk, all its tiles in a row (the group stays in L2).
+    // Dynamic hand-out: with other tenants on some cores, static splits wait for the slowest thread
+    // (14B Q6_K gate+up: 1.57 TMAC/s in the model vs 3.0 in isolation).
+    const int64_t threads = omp_get_max_threads();
+    const int tiles = (n + nt_max - 1) / nt_max;
+    const int chunks = static_cast<int>(std::clamp<int64_t>((threads * 4 + groups - 1) / groups, 1, tiles));
+    const int per = (tiles + chunks - 1) / chunks;
+#pragma omp parallel for schedule(dynamic, 1)
+    for (int64_t item = 0; item < groups * chunks; ++item) {
+      const int64_t g = item / chunks;
+      const int64_t p = g * np;
+      const int gp = static_cast<int>(std::min<int64_t>(np, panels - p));
+      const int rv = static_cast<int>(std::min<int64_t>(static_cast<int64_t>(gp) * R, w.rows - p * R));
+      const int tt_end = std::min(tiles, static_cast<int>(item % chunks + 1) * per);
+      for (int tt = static_cast<int>(item % chunks) * per; tt < tt_end; ++tt) {
         const int t0 = tt * nt_max, nt = std::min(nt_max, n - t0);
-        const int rv = static_cast<int>(std::min<int64_t>(static_cast<int64_t>(gp) * R, w.rows - p * R));
         kern::gemm_panels(w.type, wide, base + p * pb, pb, gp, w.cols, xq + t0 * nb, nt, y + t0 * w.rows + p * R,
                           w.rows, rv);
       }
