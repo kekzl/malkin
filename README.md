@@ -87,6 +87,23 @@ Shared cloud slice (netcup, 8 GB RAM, a production host), not bare metal: llama.
 
 <!-- [PROV: date=2026-10-29 hw=EPYC 9634 4 vCPU KVM (kekz.org) image=main 2228899 (draft row: PR #19 build, merged as 206b2d7) cmd=`malkin bench --ctx 4096 -pp 512 -tg 128` vs `llama-bench -p 512 -n 128 -t 4 -r 1` (ghcr.io/ggml-org/llama.cpp:full-b11960), interleaved, best of 3, docker --memory 2g (1.7B: 2500m), host load 2-6 from the runs themselves, steal 0 at idle. 9800X3D column: same binaries, OMP_NUM_THREADS=4 / --threads 4, load 0.2-2] -->
 
+### Measured on a 4-vCPU Neoverse-N1 VPS
+
+Ampere Altra cloud slice (netcup, 8 GB RAM, a production host). arm64 has no panel kernels yet (roadmap 1): every weight row is a separate NEON dot product.
+
+| Qwen3, 4 threads, best of 3 | pp512 malkin | pp512 llama.cpp | tg128 malkin | tg128 llama.cpp |
+|---|---:|---:|---:|---:|
+| 0.6B Q8_0 | 31.0 | **221.85** | 14.48 | **32.70** |
+| 0.6B Q4_K_M | 42.8 | **146.90** | 18.25 | **37.83** |
+| 1.7B Q4_K_M | 16.7 | **54.94** | 9.64 | **14.39** |
+
+| Neoverse-N1 VPS | value |
+|---|---:|
+| `bench_gemm` n=1, 1 thread, 2048x6144: Q8_0 / Q4_K / Q6_K ms (9800X3D: 0.11 / 0.08 / 0.16) | 2.62 / 1.58 / 2.05 |
+| 1.7B Q4_K_M plain / + 0.6B draft, tok/s (4 prompts) | 10.87 / 4.12 |
+
+<!-- [PROV: date=2026-10-29 hw=Neoverse-N1 4 vCPU KVM (netcup ARM, pkranefoer host) image=main 978d083 linux/arm64 cmd=`malkin bench --ctx 4096 -pp 512 -tg 128` vs `llama-bench -p 512 -n 128 -t 4 -r 1` (ghcr.io/ggml-org/llama.cpp:full-b11960), interleaved, best of 3, docker --memory 2500m, host load 0.7 at start, 4.0 at end (the runs themselves)] -->
+
 ### Where malkin loses, and what it is not
 
 - **Two ISAs.** No AVX2-only x86, no Apple, no SVE paths yet (Neoverse-V1/V2 run the N1 kernels).
@@ -95,7 +112,7 @@ Shared cloud slice (netcup, 8 GB RAM, a production host), not bare metal: llama.
 - **Small VMs.** On the 4-vCPU EPYC VPS answers are 6-35 % slower than llama.cpp: a fixed cost per token (attention 2.73 ms vs 0.36 ms on the 9800X3D) and Q4_K/Q6_K decode kernels below the Q8_0 bandwidth. A 0.6B draft slows a 1.7B target there 2.5x.
 - **RAM.** Packed panels are copies of the weights, so K-quant models take about 3x the GGUF size: Qwen3-1.7B Q4_K_M (1223 MiB file) peaks at 3912 MiB anonymous RSS with ctx 4096, 1788 MiB with `MALKIN_NO_WIDE=1` (slower prompt reading). The auto context fills half of what remains.
 - **One architecture:** Qwen3 dense (`qwen3`). No MoE, no vision, no tool calls yet.
-- **Neoverse numbers are emulated** (`qemu -cpu neoverse-n1`): correct, not benchmarked on hardware.
+- **Neoverse is a correctness path.** Without panel kernels malkin reads prompts 3.3-7.2x slower and answers 1.5-2.3x slower than llama.cpp on a Neoverse-N1 VPS (table above).
 
 ## Quick start
 
@@ -187,6 +204,5 @@ tools/bench_vs_llama.sh /path/model.gguf 512 128 2    # malkin vs llama.cpp, bac
 1. Neoverse panel GEMM (NEON `sdot` by lane); Q6_K with 256-value activation blocks (one token-scale multiply per superblock).
 2. Long context: adaptive-precision attention after [APA](https://github.com/kekzl/apa) (INT8 cold KV tiles, exact hot tiles).
 3. Architectures: `qwen3moe`, Gemma, gpt-oss (MXFP4); tool calling, Jinja chat templates.
-4. Concurrent requests (continuous batching).
 
 MIT. Sibling project for NVIDIA Blackwell GPUs: [imp](https://github.com/kekzl/imp).
