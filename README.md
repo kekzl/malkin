@@ -1,13 +1,45 @@
-# malkin
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/logo.svg">
+    <img src="docs/logo-light.svg" alt="malkin" width="560">
+  </picture>
+</p>
 
-**LLM inference server for two CPU families. Nothing else.**
+<p align="center"><b>Two CPU families. Nothing else.</b><br>
+AVX-512 (Zen 4 / Zen 5, EPYC 9004/9005, Sapphire Rapids+) · Arm Neoverse-N1+ · one <code>docker run</code> · OpenAI and Anthropic API</p>
 
-| ISA | CPUs | Kernels |
-|---|---|---|
-| x86-64: AVX-512 + VNNI + BF16 | AMD Zen 4 / Zen 5 (Ryzen 7000/9000, EPYC 9004/9005), Intel Sapphire Rapids and newer | `src/kernels_avx512.cpp` |
-| aarch64: Armv8.2-A + dotprod + fp16 | Arm Neoverse-N1 and newer (Ampere Altra, Graviton2+) | `src/kernels_neon.cpp` |
+<p align="center">
+  <img src="https://img.shields.io/badge/C++-26-00599C?style=flat&logo=cplusplus" alt="C++26">
+  <img src="https://img.shields.io/badge/LLVM-23-262D3A?style=flat&logo=llvm" alt="LLVM 23">
+  <img src="https://img.shields.io/badge/ISA-AVX--512%20VNNI%20%7C%20NEON%20dotprod-9b5cff?style=flat" alt="ISA">
+  <img src="https://img.shields.io/badge/license-MIT-blue?style=flat" alt="MIT">
+</p>
 
-No generic fallback: on any other CPU malkin exits with the missing feature list. One container, OpenAI and Anthropic API, GGUF models, MIT. Toolchain: C++26, LLVM 23 (clang, lld, libc++, libomp), CMake 4.4, Ninja 1.13.
+**malkin is an LLM server for CPUs, built for two instruction sets only:** x86-64 with AVX-512 VNNI + BF16, and Armv8.2-A with dotprod (Neoverse-N1 and newer). Weights are repacked at load into panels for the CPU's dot-product instruction; prompt reading runs as a register-blocked VNNI GEMM, generation can verify draft tokens losslessly. On any other CPU it exits with the list of missing features.
+
+### Measured on one Ryzen 7 9800X3D
+
+| Qwen3, tokens/s, 8 threads | malkin prompt | llama.cpp prompt | | malkin answer | llama.cpp answer |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 4B Q8_0 | **502.8** | 121.86 | **4.13x** | 12.55 | 13.46 |
+| 4B Q4_K_M | **514.8** | 251.24 | **2.05x** | 21.85 | 21.95 |
+| 14B Q6_K | **143.3** | 121.37 | 1.18x | **5.20** | 4.72 |
+
+<!-- [PROV: date=2026-10-29 hw=Ryzen7-9800X3D WSL2 commit=aa79ffb cmd=`tools/bench_vs_llama.sh MODEL 512 32 2` (malkin bench -pp 512 -tg 32 vs llama-bench -p 512 -n 32 -t 8, ghcr.io/ggml-org/llama.cpp:full build 8642541b2), best of 2, back to back, host load 5-8 from other tenants] -->
+
+Prompt = 512-token prefill, answer = 32-token generation, same GGUF file in both engines. Answer speed without a draft model is memory-bound and level with llama.cpp; with a draft model (below) malkin generates the same tokens faster.
+
+**Same quality.** Perplexity on the same text and windows (`malkin ppl` vs `llama-perplexity -c 512`, 2040 tokens): 4B Q8_0 18.0197 vs 18.0256, 4B Q4_K_M 18.2418 vs 18.1540 (llama.cpp's error bar: ±1.41).
+
+**Speculative decoding, lossless.** `--draft qwen3-0.6b-q8_0.gguf`: the draft proposes tokens, the target checks all of them in one pass. Greedy output is byte-identical to plain decoding; sampled output follows the target's distribution exactly (rejection step, `tests/test_sampler.cpp`). Qwen3-8B Q8_0, 200 tokens: 7.3 -> **12.0 tokens/s** (44 % of drafts accepted).
+
+### Where malkin loses, and what it is not
+
+- **Two ISAs.** No AVX2-only x86, no Apple, no SVE paths yet (Neoverse-V1/V2 run the N1 kernels).
+- **Q6_K prompt reading** is 1.18x llama.cpp, not 2x; llama.cpp's Q6_K kernels are its most efficient.
+- **One architecture:** Qwen3 dense (`qwen3`). No MoE, no vision, no tool calls yet.
+- **One sequence at a time**, with prefix reuse; no batching of concurrent requests.
+- **Neoverse numbers are emulated** (`qemu -cpu neoverse-n1`): correct, not benchmarked on hardware.
 
 ## Quick start
 
@@ -30,7 +62,7 @@ arm64 image from an amd64 host, cross-compiled, no emulation: `docker buildx bui
 | Anthropic | `/v1/messages` (SSE streaming, `thinking` blocks) |
 | Ops | `/health` |
 
-Hybrid reasoning models: `<think>` output goes to `reasoning_content` (OpenAI) or a `thinking` block (Anthropic); `chat_template_kwargs.enable_thinking=false` turns it off. One sequence at a time; the KV of the longest common token prefix with the previous request is reused.
+Hybrid reasoning models: `<think>` output goes to `reasoning_content` (OpenAI) or a `thinking` block (Anthropic); `chat_template_kwargs.enable_thinking=false` turns it off. The KV of the longest common token prefix with the previous request is reused. Responses carry `timings` (prefill and generation tokens/s, `draft_n`, `draft_n_accepted`).
 
 ## Models
 
@@ -42,61 +74,48 @@ Hybrid reasoning models: `<think>` output goes to `reasoning_content` (OpenAI) o
 | Chat format | ChatML (`<|im_start|>`) |
 | KV cache | BF16 |
 
-## Measured
+## How it works
 
-Ryzen 7 9800X3D (Zen 5, 8 cores, WSL2), 2026-10-28, `malkin bench -pp 512 -tg 128` vs `llama-bench -p 512 -n 128 -t 8` (ghcr.io/ggml-org/llama.cpp:full), tokens/s:
-
-| Model | malkin pp512 | llama.cpp pp512 | malkin tg128 | llama.cpp tg128 |
-|---|---:|---:|---:|---:|
-| Qwen3-4B-Instruct-2507 Q8_0 | 34.0 | 120.26 | 12.05 | 13.15 |
-| Qwen3-4B-Instruct-2507 Q4_K_M | 34.9 | 247.28 | 18.15 | 19.67 |
-| Qwen3-14B Q6_K | 14.8 | 125.69 | 4.62 | 4.89 |
-
-Decode reaches 92 to 95 % of llama.cpp; prefill is 3.5x to 8.5x behind (no GEMM micro-kernel yet, see Roadmap).
-
-Correctness, perplexity on the same text and windows (`malkin ppl` vs `llama-perplexity`, `-c 512`):
-
-| Model | Tokens | malkin | llama.cpp | Δ |
-|---|---:|---:|---:|---:|
-| Qwen3-4B-Instruct-2507 Q8_0 | 2040 | 18.0120 | 18.0256 | -0.08 % |
-| Qwen3-4B-Instruct-2507 Q4_K_M | 2040 | 18.2484 | 18.1540 | +0.52 % |
-| Qwen3-4B-Instruct-2507 Q5_K_M | 2040 | 18.0426 | 18.0570 | -0.08 % |
-| Qwen3-14B Q6_K | 1020 | 13.4946 | 13.4977 | -0.02 % |
-
-llama.cpp's error bar on these runs: ±1.41 (7.8 %). arm64 under `qemu-aarch64 -cpu neoverse-n1` vs x86 on Qwen3-0.6B Q8_0, 252 tokens: 39.0757 vs 38.9896.
-
-## Threads
-
-| Phase | Default | Why |
-|---|---|---|
-| decode | physical cores (`--threads`) | bandwidth-bound; 4B Q8_0 on the 9800X3D: 13.2 tok/s on 8 threads, 7.3 on 16 |
-| prefill | all logical CPUs (`--threads-batch`) | compute-bound; pp128 42.5 -> 52.8 tok/s with SMT |
-
-All compute runs on one engine thread with one OpenMP pool. Weights are first-touched in parallel at load, so on NUMA hosts (EPYC NPS2/NPS4) pages spread across nodes. Matmul tiles shrink to keep at least 4 tiles per thread (84-core EPYC 9634: 1024-row matrices get 3-row tiles).
+| Piece | What it does |
+|---|---|
+| Panels | 16 weight rows interleaved per 64-byte vector, one `vpdpbusd` lane per row; compact panels (about GGUF size) for generation, wide panels (one byte per weight) for K-quant prompt reading |
+| GEMM | 2 panels x up to 6 tokens per call, activations as Q8 blocks of 32 with per-half sums for the K-quant minimum terms; work handed out dynamically per (panel pair, token chunk) |
+| Attention | the query heads of one KV head (GQA) share every K/V row load; vectorized exp |
+| Threads | one engine thread, one OpenMP pool; physical cores for both phases (prefill 348.1 vs 188.7 tok/s on 16 SMT threads, 9800X3D) |
+| NUMA | weights first-touched in parallel at load, so pages spread across EPYC NPS2/NPS4 nodes |
 
 ## CLI
 
 ```
 malkin [serve] --model PATH [--host 0.0.0.0] [--port 8080] [--ctx N] [--threads N] [--threads-batch N]
-malkin run     --model PATH -p TEXT [-n 512] [--temp 0] [--no-think]
+               [--draft PATH] [--n-draft N]
+malkin run     --model PATH -p TEXT [-n 512] [--temp 0] [--no-think] [--draft PATH]
 malkin bench   --model PATH [-pp 512] [-tg 128]
 malkin ppl     --model PATH -f FILE [--window 512]
 ```
 
-`--ctx` defaults to min(model context, 32768), capped so the BF16 KV takes at most half of the RAM left after the weights.
+| Environment | Effect |
+|---|---|
+| `MALKIN_NO_WIDE=1` | no wide prompt panels (saves about 1 byte per K-quant weight of RAM) |
+| `MALKIN_NO_PACK=1` | row-by-row kernels only (A/B reference) |
+| `MALKIN_PROFILE=1` | wall time per forward stage at exit |
 
 ## Build and test
 
+Toolchain: C++26, LLVM 23 (clang, lld, libc++, libomp), CMake 4.4, Ninja 1.13, all in Docker.
+
 ```bash
-docker build --target test .                          # x86 kernel tests (skip without AVX-512 BF16)
-docker build --target test --platform linux/arm64 .   # arm64 kernel tests through qemu, Neoverse-N1 CPU model
+docker build --target test .                          # x86 kernel + sampler tests (kernels skip without AVX-512 BF16)
+docker build --target test --platform linux/arm64 .   # same through qemu, Neoverse-N1 CPU model
 tests/api_smoke.sh http://127.0.0.1:8080              # 14 API checks against a running server
+tools/bench_vs_llama.sh /path/model.gguf 512 128 2    # malkin vs llama.cpp, back to back
 ```
 
 ## Roadmap
 
-1. Prefill: GEMM micro-kernels (multi-token weight reuse) for AVX-512 and NEON.
-2. Architectures: `qwen3moe`, Gemma, gpt-oss (MXFP4).
-3. Tool calling, Jinja chat templates.
-4. Continuous batching for concurrent requests.
-5. Neoverse-V1/V2 paths (SVE, i8mm, BF16), AMX on Intel.
+1. Q6_K prompt kernels toward 2x; Neoverse panel GEMM (NEON `sdot` by lane).
+2. Long context: adaptive-precision attention after [APA](https://github.com/kekzl/apa) (INT8 cold KV tiles, exact hot tiles).
+3. Architectures: `qwen3moe`, Gemma, gpt-oss (MXFP4); tool calling, Jinja chat templates.
+4. Concurrent requests (continuous batching).
+
+MIT. Sibling project for NVIDIA Blackwell GPUs: [imp](https://github.com/kekzl/imp).
