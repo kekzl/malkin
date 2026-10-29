@@ -66,7 +66,7 @@ Engine::Engine(const EngineOptions& o) {
     draft_ = std::make_unique<Model>(*dfile_, n_ctx);
     dlogits_.resize(static_cast<size_t>(draft_->cfg().n_vocab));
     if (o.n_draft > 0) n_draft_ = std::min(o.n_draft, Model::kMaxBatch - 1);
-    vlogits_.resize(static_cast<size_t>(n_draft_ + 1) * model_->cfg().n_vocab);
+    vlogits_.resize(static_cast<size_t>(2 * n_draft_ + 1) * model_->cfg().n_vocab);  // tree: chain + alternatives
     std::fprintf(stderr, "malkin: draft %s, %d layers, up to %d tokens per step\n",
                  std::filesystem::path(o.draft_path).stem().c_str(), draft_->cfg().n_layer, n_draft_);
   }
@@ -218,6 +218,85 @@ GenResult Engine::generate_locked(const GenRequest& req, const OnText& on_text) 
       model_->forward(&next, 1, static_cast<int>(cache_.size()), logits_.data(), false);
       cache_.push_back(next);
       next = sampler.sample(logits_.data(), n_vocab);
+    }
+  } else if (req.sampling.temperature <= 0.0f) {
+    // Greedy tree speculation: the draft's top-1 chain plus its top-2 alternative at every depth (free, same
+    // draft logits), verified in one target pass. Accepts the longest path the target's argmax follows.
+    std::vector<int32_t> batch, chain, alt;
+    std::vector<int> parent;
+    Dist p;
+    int k = std::min(4, n_draft_);
+    const int dv = draft_->cfg().n_vocab;
+    bool go = emit(next);
+    while (go) {
+      const int room = std::min(budget - r.completion_tokens, (n_ctx - static_cast<int>(cache_.size()) - 2) / 2);
+      const int kk = std::max(0, std::min(k, room));
+      chain.clear();
+      alt.clear();
+      if (kk > 0) {
+        std::vector<int32_t> ctx = cache_;
+        ctx.push_back(next);
+        draft_sync(ctx);
+        for (int i = 0; i < kk; ++i) {
+          int32_t a = 0, b = 1;
+          if (dlogits_[b] > dlogits_[a]) std::swap(a, b);
+          for (int32_t v = 2; v < dv; ++v) {
+            if (dlogits_[v] > dlogits_[a]) b = a, a = v;
+            else if (dlogits_[v] > dlogits_[b]) b = v;
+          }
+          chain.push_back(a);
+          alt.push_back(b);
+          if (i + 1 < kk) {
+            draft_->forward(&a, 1, static_cast<int>(dcache_.size()), dlogits_.data(), false);
+            dcache_.push_back(a);
+          }
+        }
+      }
+      // Layout: [next, chain0, alt0, chain1, alt1, ...]; chain i at 1 + 2i, alt i at 2 + 2i.
+      batch.assign(1, next);
+      parent.assign(1, -1);
+      for (int i = 0; i < kk; ++i) {
+        const int par = i == 0 ? 0 : 2 * i - 1;
+        batch.push_back(chain[i]);
+        parent.push_back(par);
+        batch.push_back(alt[i]);
+        parent.push_back(par);
+      }
+      const int pos0 = static_cast<int>(cache_.size());
+      model_->forward(batch.data(), static_cast<int>(batch.size()), pos0, vlogits_.data(), true, parent.data());
+      cache_.push_back(next);
+      r.drafted += kk;
+      int cur = 0, i = 0;
+      bool bonus_ready = false;
+      for (; i < kk; ++i) {
+        sampler.distribution(vlogits_.data() + static_cast<size_t>(cur) * n_vocab, n_vocab, p);
+        const int32_t a = p[0].second;
+        int slot = -1;
+        if (a == chain[i]) slot = 1 + 2 * i;
+        else if (a == alt[i]) slot = 2 + 2 * i;
+        if (slot < 0) {
+          next = a;
+          bonus_ready = true;
+          break;
+        }
+        model_->move_kv(pos0 + slot, static_cast<int>(cache_.size()));
+        cache_.push_back(a);
+        ++r.accepted;
+        cur = slot;
+        if (!(go = emit(a))) break;
+        if (slot == 2 + 2 * i) {  // alternative leaf: nothing below it
+          ++i;
+          break;
+        }
+      }
+      if (!go) break;
+      if (!bonus_ready) {
+        sampler.distribution(vlogits_.data() + static_cast<size_t>(cur) * n_vocab, n_vocab, p);
+        next = p[0].second;
+      }
+      if (i == kk && kk == k && cur == 2 * kk - 1) k = std::min(k + 1, n_draft_);
+      else if (2 * i < kk) k = std::max(1, k - 1);
+      go = emit(next);
     }
   } else {
     // Speculative decoding. Invariant: cache_ holds the tokens with target KV; next is sampled, not in KV.

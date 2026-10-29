@@ -194,17 +194,18 @@ void gemm_panels(GgmlType, bool, const uint8_t*, size_t, int, int64_t, const Blo
 namespace malkin::kern {
 
 void attend_gqa(const float* q, int G, int D, const uint16_t* k, const uint16_t* v, size_t stride, int n, float scale,
-                float* out, float* scratch) {
+                float* out, float* scratch, const int* extra, int ne) {
+  const int nk = n + ne;
+  auto key = [&](int j) { return static_cast<size_t>(j < n ? j : extra[j - n]) * stride; };
   for (int h = 0; h < G; ++h) {
-    float* s = scratch + static_cast<size_t>(h) * n;
+    float* s = scratch + static_cast<size_t>(h) * nk;
     float mx = -INFINITY;
-    for (int j = 0; j < n; ++j) mx = std::max(mx, s[j] = dot_f32_bf16(q + h * D, k + j * stride, D) * scale);
+    for (int j = 0; j < nk; ++j) mx = std::max(mx, s[j] = dot_f32_bf16(q + h * D, k + key(j), D) * scale);
     float sum = 0.0f;
-    for (int j = 0; j < n; ++j) sum += s[j] = std::exp(s[j] - mx);
+    for (int j = 0; j < nk; ++j) sum += s[j] = std::exp(s[j] - mx);
     float* o = out + h * D;
     for (int d = 0; d < D; ++d) o[d] = 0.0f;
-    for (int j = 0; j < n; ++j) axpy_bf16(s[j] / sum, v + j * stride, o, D);
+    for (int j = 0; j < nk; ++j) axpy_bf16(s[j] / sum, v + key(j), o, D);
   }
 }
-
 }  // namespace malkin::kern
