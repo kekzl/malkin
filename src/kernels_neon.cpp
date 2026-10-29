@@ -182,35 +182,88 @@ void axpy_bf16(float a, const uint16_t* v, float* y, int n) {
 
 namespace malkin::kern {
 
-// No NEON panel kernels yet: panel_bytes() == 0 keeps every weight on the row path.
-int panel_rows() { return 4; }
-size_t panel_bytes(GgmlType, int64_t, bool) { return 0; }
-void pack_panel(GgmlType, bool, const uint8_t*, size_t, int, int64_t, uint8_t*) {}
-int gemm_tile(GgmlType, bool) { return 1; }
-bool gemm_unsigned_acts(GgmlType, bool) { return false; }
-void gemm_panels(GgmlType, bool, const uint8_t*, size_t, int, int64_t, const BlockQ8*, int, float*, int64_t, int) {}
+namespace {
 
-}  // namespace malkin::kern
+// e^x as exp512 (kernels_avx512.cpp): Cody-Waite reduction, degree-6 Taylor, rel err ~1e-7; x clamped to [-87, 88].
+inline float32x4_t exp4(float32x4_t x) {
+  x = vminq_f32(vmaxq_f32(x, vdupq_n_f32(-87.0f)), vdupq_n_f32(88.0f));
+  const float32x4_t n = vrndnq_f32(vmulq_n_f32(x, 1.44269504088896341f));
+  float32x4_t r = vfmsq_f32(x, n, vdupq_n_f32(0.693145751953125f));
+  r = vfmsq_f32(r, n, vdupq_n_f32(1.42860682030941723e-6f));
+  float32x4_t p = vdupq_n_f32(1.0f / 720.0f);
+  for (float c : {1.0f / 120.0f, 1.0f / 24.0f, 1.0f / 6.0f, 0.5f, 1.0f, 1.0f}) p = vfmaq_f32(vdupq_n_f32(c), p, r);
+  const int32x4_t e = vshlq_n_s32(vaddq_s32(vcvtq_s32_f32(n), vdupq_n_s32(127)), 23);
+  return vmulq_f32(p, vreinterpretq_f32_s32(e));
+}
 
-namespace malkin::kern {
+// s[i] = exp(s[i] - max(s)), returns 1 / sum.
+float softmax_inplace(float* s, int n) {
+  float32x4_t m = vdupq_n_f32(-INFINITY);
+  int i = 0;
+  for (; i + 4 <= n; i += 4) m = vmaxq_f32(m, vld1q_f32(s + i));
+  float mx = vmaxvq_f32(m);
+  for (; i < n; ++i) mx = std::max(mx, s[i]);
+  const float32x4_t vm = vdupq_n_f32(mx);
+  float32x4_t sum = vdupq_n_f32(0.0f);
+  for (i = 0; i + 4 <= n; i += 4) {
+    const float32x4_t e = exp4(vsubq_f32(vld1q_f32(s + i), vm));
+    vst1q_f32(s + i, e);
+    sum = vaddq_f32(sum, e);
+  }
+  float tail = 0.0f;
+  for (; i < n; ++i) tail += s[i] = std::exp(s[i] - mx);
+  return 1.0f / (vaddvq_f32(sum) + tail);
+}
+
+// out[0..4C) = iv * sum_j p[j] * v_j[0..4C): C accumulators stay in registers.
+template <int C, class Row>
+void pv_pass(const float* p, int n, const uint16_t* v, Row row, float iv, float* out) {
+  float32x4_t acc[C];
+  for (auto& a : acc) a = vdupq_n_f32(0.0f);
+  for (int j = 0; j < n; ++j) {
+    const uint16_t* vr = v + row(j);
+    for (int c = 0; c < C; ++c) acc[c] = vfmaq_n_f32(acc[c], bf16x4(vr + 4 * c), p[j]);
+  }
+  for (int c = 0; c < C; ++c) vst1q_f32(out + 4 * c, vmulq_n_f32(acc[c], iv));
+}
+
+}  // namespace
 
 void silu_mul(int64_t n, float* g, const float* u) {
-  for (int64_t i = 0; i < n; ++i) g[i] = g[i] / (1.0f + std::exp(-g[i])) * u[i];
+  int64_t i = 0;
+  for (; i + 4 <= n; i += 4) {
+    const float32x4_t x = vld1q_f32(g + i);
+    const float32x4_t e = exp4(vnegq_f32(x));
+    vst1q_f32(g + i, vmulq_f32(vdivq_f32(x, vaddq_f32(vdupq_n_f32(1.0f), e)), vld1q_f32(u + i)));
+  }
+  for (; i < n; ++i) g[i] = g[i] / (1.0f + std::exp(-g[i])) * u[i];
 }
 
-void attend_gqa(const float* q, int G, int D, const uint16_t* k, const uint16_t* v, size_t stride, int n, float scale,
+void attend_gqa(const float* q, int G, int D, const uint16_t* k, const uint16_t* v, size_t stride, int n0, float scale,
                 float* out, float* scratch, const int* extra, int ne) {
-  const int nk = n + ne;
-  auto key = [&](int j) { return static_cast<size_t>(j < n ? j : extra[j - n]) * stride; };
+  const int n = n0 + ne;
+  auto row = [&](int j) { return static_cast<size_t>(j < n0 ? j : extra[j - n0]) * stride; };
+  // Scores: each key row is read once for all G heads.
+  for (int j = 0; j < n; ++j) {
+    const uint16_t* kr = k + row(j);
+    for (int h = 0; h < G; ++h) {
+      const float* qh = q + static_cast<size_t>(h) * D;
+      float32x4_t a[4] = {vdupq_n_f32(0.0f), vdupq_n_f32(0.0f), vdupq_n_f32(0.0f), vdupq_n_f32(0.0f)};
+      for (int d = 0; d < D; d += 16)
+        for (int c = 0; c < 4; ++c) a[c] = vfmaq_f32(a[c], vld1q_f32(qh + d + 4 * c), bf16x4(kr + d + 4 * c));
+      scratch[static_cast<size_t>(h) * n + j] =
+          vaddvq_f32(vaddq_f32(vaddq_f32(a[0], a[1]), vaddq_f32(a[2], a[3]))) * scale;
+    }
+  }
+  // Values: 64 output floats per pass (16 registers), 16 for the rest of D.
   for (int h = 0; h < G; ++h) {
-    float* s = scratch + static_cast<size_t>(h) * nk;
-    float mx = -INFINITY;
-    for (int j = 0; j < nk; ++j) mx = std::max(mx, s[j] = dot_f32_bf16(q + h * D, k + key(j), D) * scale);
-    float sum = 0.0f;
-    for (int j = 0; j < nk; ++j) sum += s[j] = std::exp(s[j] - mx);
-    float* o = out + h * D;
-    for (int d = 0; d < D; ++d) o[d] = 0.0f;
-    for (int j = 0; j < nk; ++j) axpy_bf16(s[j] / sum, v + key(j), o, D);
+    float* s = scratch + static_cast<size_t>(h) * n;
+    const float iv = softmax_inplace(s, n);
+    float* o = out + static_cast<size_t>(h) * D;
+    int d = 0;
+    for (; d + 64 <= D; d += 64) pv_pass<16>(s, n, v + d, row, iv, o + d);
+    for (; d < D; d += 16) pv_pass<4>(s, n, v + d, row, iv, o + d);
   }
 }
+
 }  // namespace malkin::kern
