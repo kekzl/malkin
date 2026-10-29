@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 260" width="640" height="260">
+  <defs>
+    <linearGradient id="fur" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3a2752"/>
+      <stop offset="1" stop-color="#140b21"/>
+    </linearGradient>
+    <radialGradient id="eye" cx="0.5" cy="0.45" r="0.6">
+      <stop offset="0" stop-color="#fff6c2"/>
+      <stop offset="0.5" stop-color="#ffc53a"/>
+      <stop offset="1" stop-color="#ff7a00"/>
+    </radialGradient>
+    <radialGradient id="aura" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#9b5cff" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#9b5cff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="die" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4a4f5c"/>
+      <stop offset="1" stop-color="#1c1f26"/>
+    </linearGradient>
+    <linearGradient id="txt" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3b2260"/>
+      <stop offset="0.45" stop-color="#2c1a47"/>
+      <stop offset="1" stop-color="#1a0f2b"/>
+    </linearGradient>
+  </defs>
+
+  <circle cx="150" cy="128" r="122" fill="url(#aura)"/>
+
+  <!-- CPU package the cat sits on -->
+  <g stroke="#c9a227" stroke-width="3" stroke-linecap="round">
+    <line x1="92" y1="196" x2="92" y2="244"/><line x1="112" y1="196" x2="112" y2="244"/>
+    <line x1="132" y1="196" x2="132" y2="244"/><line x1="152" y1="196" x2="152" y2="244"/>
+    <line x1="172" y1="196" x2="172" y2="244"/><line x1="192" y1="196" x2="192" y2="244"/>
+    <line x1="208" y1="196" x2="208" y2="244"/>
+    <line x1="70" y1="206" x2="86" y2="206"/><line x1="70" y1="226" x2="86" y2="226"/>
+    <line x1="214" y1="206" x2="230" y2="206"/><line x1="214" y1="226" x2="230" y2="226"/>
+  </g>
+  <rect x="82" y="190" width="136" height="44" rx="7" fill="url(#die)" stroke="#6b7182" stroke-width="1.5"/>
+  <rect x="104" y="198" width="92" height="28" rx="3" fill="#2b2f38" stroke="#c9a227" stroke-width="1.2" stroke-opacity="0.7"/>
+  <g stroke="#9b5cff" stroke-width="1.2" stroke-opacity="0.8" fill="none">
+    <path d="M110 206 H130 V218 H150"/><path d="M190 204 H170 V214 H158"/><path d="M118 222 H140"/>
+  </g>
+
+  <!-- tail -->
+  <path d="M184 186 C222 184 236 152 222 128 C214 114 222 100 234 108" fill="none" stroke="url(#fur)"
+        stroke-width="11" stroke-linecap="round"/>
+  <!-- body -->
+  <path d="M108 192 C100 150 118 120 150 120 C182 120 200 150 192 192 Z" fill="url(#fur)"/>
+  <!-- ears -->
+  <path d="M122 82 L114 40 L146 66 Z" fill="#2c1d40"/>
+  <path d="M178 82 L186 40 L154 66 Z" fill="#2c1d40"/>
+  <path d="M124 74 L120 52 L138 66 Z" fill="#5b3c86"/>
+  <path d="M176 74 L180 52 L162 66 Z" fill="#5b3c86"/>
+  <!-- head -->
+  <ellipse cx="150" cy="94" rx="38" ry="34" fill="url(#fur)"/>
+  <!-- eyes -->
+  <ellipse cx="135" cy="92" rx="9" ry="6.5" fill="url(#eye)"/>
+  <ellipse cx="165" cy="92" rx="9" ry="6.5" fill="url(#eye)"/>
+  <ellipse cx="135" cy="92" rx="1.8" ry="5.4" fill="#1a0f05"/>
+  <ellipse cx="165" cy="92" rx="1.8" ry="5.4" fill="#1a0f05"/>
+  <!-- nose and whiskers -->
+  <path d="M146 104 L154 104 L150 109 Z" fill="#c97fa0"/>
+  <g stroke="#d9cdf0" stroke-width="1.1" stroke-opacity="0.55" stroke-linecap="round">
+    <line x1="140" y1="108" x2="104" y2="102"/><line x1="140" y1="111" x2="105" y2="114"/>
+    <line x1="160" y1="108" x2="196" y2="102"/><line x1="160" y1="111" x2="195" y2="114"/>
+  </g>
+
+  <text x="268" y="146" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="86" font-weight="800"
+        fill="url(#txt)">malkin</text>
+  <text x="272" y="186" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" fill="#5e4a86">LLM inference for AVX-512 and Neoverse CPUs</text>
+</svg>
