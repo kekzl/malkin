@@ -34,7 +34,9 @@ class Model {
  public:
   static constexpr int kMaxBatch = 256;
 
+  // n_ctx 0: weights only; alloc_kv before the first forward.
   Model(const GgufFile& f, int n_ctx, int n_seq = 1);
+  void alloc_kv(int n_ctx);
   const ModelConfig& cfg() const { return cfg_; }
   int n_ctx() const { return n_ctx_; }
   int n_seq() const { return n_seq_; }

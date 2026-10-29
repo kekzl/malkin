@@ -5,6 +5,8 @@
 #include <sys/auxv.h>
 #endif
 
+#include <algorithm>
+#include <cstdint>
 #include <fstream>
 #include <set>
 #include <thread>
@@ -79,12 +81,47 @@ int cpu_physical_cores() {
   return static_cast<int>(cores.size());
 }
 
+namespace {
+
+// SIZE_MAX: no such file or "max".
+size_t read_size(const std::string& path) {
+  std::ifstream f(path);
+  std::string s;
+  if (!(f >> s) || s == "max") return SIZE_MAX;
+  return std::stoull(s);
+}
+
+}  // namespace
+
 size_t mem_available_bytes() {
+  size_t avail = 0;
   std::ifstream f("/proc/meminfo");
   for (std::string line; std::getline(f, line);) {
-    if (line.starts_with("MemAvailable:")) return std::stoull(line.substr(13)) * 1024;
+    if (line.starts_with("MemAvailable:")) avail = std::stoull(line.substr(13)) * 1024;
   }
-  return 0;
+  // cgroup v2 limits (docker --memory, systemd MemoryMax), tightest ancestor: limit - (usage - page cache).
+  std::ifstream cg("/proc/self/cgroup");
+  std::string dir;
+  for (std::string line; std::getline(cg, line);) {
+    if (line.starts_with("0::")) dir = line.substr(3);
+  }
+  while (!dir.empty()) {
+    const std::string d = "/sys/fs/cgroup" + (dir == "/" ? std::string() : dir);
+    const size_t max = read_size(d + "/memory.max"), cur = read_size(d + "/memory.current");
+    if (max != SIZE_MAX && cur != SIZE_MAX) {
+      size_t file = 0;
+      std::ifstream st(d + "/memory.stat");
+      for (std::string line; std::getline(st, line);) {
+        if (line.starts_with("file ")) file = std::stoull(line.substr(5));
+      }
+      const size_t used = cur - std::min(file, cur);
+      avail = std::min(avail, max > used ? max - used : 0);
+    }
+    if (dir == "/") break;
+    const size_t slash = dir.rfind('/');
+    dir = slash == 0 ? "/" : dir.substr(0, slash);
+  }
+  return avail;
 }
 
 }  // namespace malkin

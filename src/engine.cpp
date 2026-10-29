@@ -109,18 +109,9 @@ Engine::Engine(const EngineOptions& o) {
   omp_set_num_threads(threads_);
 
   const int n_seq = std::clamp(o.parallel, 1, Model::kMaxBatch);
-  int n_ctx = o.n_ctx > 0 ? o.n_ctx : std::min(cfg.n_ctx_train, 32768);
-  if (o.n_ctx <= 0) {
-    // Auto: KV of all sequences may take half of the RAM left after the weights.
-    size_t avail = mem_available_bytes();
-    size_t budget = avail > file_->file_size() ? (avail - file_->file_size()) / 2 : 0;
-    n_ctx = std::max(512, std::min<int>(n_ctx, static_cast<int>(budget / n_seq / kv_bytes_per_token(cfg))));
-  }
-  n_ctx = std::min(n_ctx, cfg.n_ctx_train);
-
   tok_ = std::make_unique<Tokenizer>(*file_);
   chat_ = std::make_unique<ChatFormat>(*tok_, file_->get_str("tokenizer.chat_template").value_or(""));
-  model_ = std::make_unique<Model>(*file_, n_ctx, n_seq);
+  model_ = std::make_unique<Model>(*file_, 0, n_seq);
   slots_.resize(n_seq);
   if (!o.draft_path.empty()) {
     dfile_ = std::make_unique<GgufFile>(o.draft_path);
@@ -129,13 +120,23 @@ Engine::Engine(const EngineOptions& o) {
     for (int32_t id : {0, 1000, 100000, static_cast<int32_t>(tok_->size()) - 1})
       same = same && dtok.piece(id) == tok_->piece(id);
     if (!same) throw std::runtime_error("draft model tokenizer differs from the target");
-    draft_ = std::make_unique<Model>(*dfile_, n_ctx, n_seq);
+    draft_ = std::make_unique<Model>(*dfile_, 0, n_seq);
     dlogits_.resize(static_cast<size_t>(n_seq) * draft_->cfg().n_vocab);
     dout_.resize(dlogits_.size());
     if (o.n_draft > 0) n_draft_ = std::min(o.n_draft, Model::kMaxBatch - 1);
     std::fprintf(stderr, "malkin: draft %s, %d layers, up to %d tokens per step\n",
                  std::filesystem::path(o.draft_path).stem().c_str(), draft_->cfg().n_layer, n_draft_);
   }
+  int n_ctx = o.n_ctx > 0 ? o.n_ctx : std::min(cfg.n_ctx_train, 32768);
+  if (o.n_ctx <= 0) {
+    // Auto: KV (target + draft, all sequences) may take half of the RAM left once the packed weights are resident
+    // (wide panels: ~3x a Q4_K_M file); cgroup limits count.
+    const size_t per_token = kv_bytes_per_token(cfg) + (draft_ ? kv_bytes_per_token(draft_->cfg()) : 0);
+    n_ctx = std::max(512, std::min<int>(n_ctx, static_cast<int>(mem_available_bytes() / 2 / n_seq / per_token)));
+  }
+  n_ctx = std::min(n_ctx, cfg.n_ctx_train);
+  model_->alloc_kv(n_ctx);
+  if (draft_) draft_->alloc_kv(n_ctx);
   // Logits rows: every decode token (greedy tree: 2 * n_draft + 1 per slot, at most kMaxBatch) plus one per
   // prompt that finishes in the step.
   const int rows = std::min(Model::kMaxBatch, n_seq * (draft_ ? 2 * n_draft_ + 1 : 1)) + n_seq;
