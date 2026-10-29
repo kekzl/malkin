@@ -43,7 +43,7 @@ void Sampler::distribution(float* logits, int n_vocab, Dist& out) {
     sum += c.first;
   }
   // min_p relative to the top probability, then nucleus.
-  const double floor = p_.min_p * cand_[0].first;
+  const double floor = static_cast<double>(p_.min_p) * cand_[0].first;
   double kept = 0;
   size_t n = 0;
   for (; n < cand_.size(); ++n) {
