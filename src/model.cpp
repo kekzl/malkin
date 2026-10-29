@@ -104,7 +104,7 @@ size_t kv_bytes_per_token(const ModelConfig& c) {
   return static_cast<size_t>(c.n_layer) * c.n_head_kv * c.head_dim * 2 * sizeof(uint16_t);
 }
 
-Model::Model(const GgufFile& f, int n_ctx) : cfg_(read_config(f)), n_ctx_(n_ctx) {
+Model::Model(const GgufFile& f, int n_ctx, int n_seq) : cfg_(read_config(f)), n_ctx_(n_ctx), n_seq_(n_seq) {
   const auto& c = cfg_;
   if (c.head_dim % 32 || c.n_head % c.n_head_kv) throw std::runtime_error("model: unsupported head layout");
   tok_embd_ = weight(f, "token_embd.weight");
@@ -143,7 +143,7 @@ Model::Model(const GgufFile& f, int n_ctx) : cfg_(read_config(f)), n_ctx_(n_ctx)
   for (int i = 0; i < c.head_dim / 2; ++i) inv_freq_.push_back(std::pow(c.rope_base, -2.0f * i / c.head_dim));
 
   const size_t kv_row = static_cast<size_t>(c.n_head_kv) * c.head_dim;
-  kcache_.assign(static_cast<size_t>(c.n_layer) * n_ctx * kv_row, 0);
+  kcache_.assign(static_cast<size_t>(c.n_layer) * n_seq * n_ctx * kv_row, 0);
   vcache_.assign(kcache_.size(), 0);
   const size_t B = kMaxBatch;
   x_.resize(B * c.n_embd);
@@ -158,12 +158,11 @@ Model::Model(const GgufFile& f, int n_ctx) : cfg_(read_config(f)), n_ctx_(n_ctx)
   rope_sin_.resize(rope_cos_.size());
 }
 
-void Model::attention(int il, int n, int pos) {
+void Model::attention(int il, int n) {
   const auto& c = cfg_;
   const int D = c.head_dim, H = c.n_head, KV = c.n_head_kv, G = H / KV;
   const size_t kv_row = static_cast<size_t>(KV) * D;
-  const uint16_t* kc = kcache_.data() + static_cast<size_t>(il) * n_ctx_ * kv_row;
-  const uint16_t* vc = vcache_.data() + static_cast<size_t>(il) * n_ctx_ * kv_row;
+  const size_t layer = static_cast<size_t>(il) * n_seq_ * n_ctx_ * kv_row;
   const float scale = 1.0f / std::sqrt(static_cast<float>(D));
   // Work items: (token, KV head); the G query heads of a KV head share every K/V row load.
 #pragma omp parallel
@@ -174,16 +173,20 @@ void Model::attention(int il, int n, int pos) {
     for (int t = 0; t < n; ++t) {
       for (int g = 0; g < KV; ++g) {
         const size_t qoff = (static_cast<size_t>(t) * H + static_cast<size_t>(g) * G) * D;
+        const size_t kv = layer + static_cast<size_t>(kv_base_[t]) * kv_row + static_cast<size_t>(g) * D;
         const bool tree = !anc_off_.empty();
-        kern::attend_gqa(q_.data() + qoff, G, D, kc + static_cast<size_t>(g) * D, vc + static_cast<size_t>(g) * D,
-                         kv_row, tree ? pos : pos + t + 1, scale, att_.data() + qoff, scratch.data(),
-                         tree ? anc_.data() + anc_off_[t] : nullptr, tree ? anc_off_[t + 1] - anc_off_[t] : 0);
+        kern::attend_gqa(q_.data() + qoff, G, D, kcache_.data() + kv, vcache_.data() + kv, kv_row, n_keys_[t], scale,
+                         att_.data() + qoff, scratch.data(), tree ? anc_.data() + anc_off_[t] : nullptr,
+                         tree ? anc_off_[t + 1] - anc_off_[t] : 0);
       }
     }
   }
 }
 
-void Model::forward(const int32_t* tokens, int n, int pos, float* logits, bool all_logits, const int* parent) {
+void Model::forward(const int32_t* tokens, int n, int pos, float* logits, bool all_logits, const int* parent, int seq) {
+  if (n <= 0 || n > kMaxBatch) throw std::runtime_error("forward: batch size out of range");
+  if (pos + n > n_ctx_) throw std::runtime_error("forward: context full");
+  if (seq < 0 || seq >= n_seq_) throw std::runtime_error("forward: bad sequence");
   depth_.clear();
   anc_.clear();
   anc_off_.clear();
@@ -197,20 +200,57 @@ void Model::forward(const int32_t* tokens, int n, int pos, float* logits, bool a
     }
     anc_off_.push_back(static_cast<int>(anc_.size()));
   }
-  const auto& c = cfg_;
+  rpos_.resize(n);
+  kv_at_.resize(n);
+  kv_base_.assign(n, seq * n_ctx_);
+  n_keys_.resize(n);
+  out_.clear();
+  for (int t = 0; t < n; ++t) {
+    rpos_[t] = pos + (parent ? depth_[t] : t);
+    kv_at_[t] = seq * n_ctx_ + pos + t;
+    n_keys_[t] = parent ? pos : pos + t + 1;  // tree: prefix only, ancestors come as extra rows
+    if (all_logits || t == n - 1) out_.push_back(t);
+  }
+  run(tokens, n, logits);
+}
+
+void Model::forward(const BatchToken* batch, int n, float* logits) {
   if (n <= 0 || n > kMaxBatch) throw std::runtime_error("forward: batch size out of range");
-  if (pos + n > n_ctx_) throw std::runtime_error("forward: context full");
+  depth_.clear();
+  anc_.clear();
+  anc_off_.clear();
+  ids_.resize(n);
+  rpos_.resize(n);
+  kv_at_.resize(n);
+  kv_base_.resize(n);
+  n_keys_.resize(n);
+  out_.clear();
+  for (int t = 0; t < n; ++t) {
+    const BatchToken& b = batch[t];
+    if (b.seq < 0 || b.seq >= n_seq_ || b.pos < 0 || b.pos >= n_ctx_) throw std::runtime_error("forward: bad slot");
+    ids_[t] = b.id;
+    rpos_[t] = b.pos;
+    kv_base_[t] = b.seq * n_ctx_;
+    kv_at_[t] = kv_base_[t] + b.pos;
+    n_keys_[t] = b.pos + 1;
+    if (b.logits) out_.push_back(t);
+  }
+  run(ids_.data(), n, logits);
+}
+
+void Model::run(const int32_t* tokens, int n, float* logits) {
+  const auto& c = cfg_;
   const int E = c.n_embd, D = c.head_dim, H = c.n_head, KV = c.n_head_kv, F = c.n_ff;
   const size_t kv_row = static_cast<size_t>(KV) * D;
 
-  // Token embeddings, then RoPE angles per token (tree mode: prefix + depth).
+  // Token embeddings, then RoPE angles per token.
   for (int t = 0; t < n; ++t) {
     if (tokens[t] < 0 || tokens[t] >= tok_embd_.rows) throw std::runtime_error("forward: token id out of range");
     dequantize_row(tok_embd_.type, tok_embd_.row(tokens[t]), x_.data() + static_cast<size_t>(t) * E, E);
   }
   for (int t = 0; t < n; ++t) {
     for (int i = 0; i < D / 2; ++i) {
-      float a = static_cast<float>(pos + (anc_off_.empty() ? t : depth_[t])) * inv_freq_[i];
+      float a = static_cast<float>(rpos_[t]) * inv_freq_[i];
       rope_cos_[t * D / 2 + i] = std::cos(a);
       rope_sin_[t * D / 2 + i] = std::sin(a);
     }
@@ -244,9 +284,8 @@ void Model::forward(const int32_t* tokens, int n, int pos, float* logits, bool a
     matmul(L.wv, h_.data(), xq_.data(), n, v_.data());
     lap(0);
 
-    // Q/K head norms, RoPE, then K and V into the cache at positions pos..pos+n-1.
-    uint16_t* kc = kcache_.data() + (static_cast<size_t>(il) * n_ctx_ + pos) * kv_row;
-    uint16_t* vc = vcache_.data() + (static_cast<size_t>(il) * n_ctx_ + pos) * kv_row;
+    // Q/K head norms, RoPE, then K and V into the cache rows kv_at_.
+    const size_t layer = static_cast<size_t>(il) * n_seq_ * n_ctx_;
 #pragma omp parallel for schedule(static) if (n > 1)
     for (int t = 0; t < n; ++t) {
       for (int h = 0; h < H; ++h) {
@@ -260,14 +299,14 @@ void Model::forward(const int32_t* tokens, int n, int pos, float* logits, bool a
         rope(k, t);
       }
       for (size_t i = 0; i < kv_row; ++i) {
-        kc[t * kv_row + i] = fp32_to_bf16(k_[t * kv_row + i]);
-        vc[t * kv_row + i] = fp32_to_bf16(v_[t * kv_row + i]);
+        kcache_[(layer + kv_at_[t]) * kv_row + i] = fp32_to_bf16(k_[t * kv_row + i]);
+        vcache_[(layer + kv_at_[t]) * kv_row + i] = fp32_to_bf16(v_[t * kv_row + i]);
       }
     }
 
     lap(1);
     // Attention over the BF16 KV cache, output projection, residual add.
-    attention(il, n, pos);
+    attention(il, n);
     lap(2);
     quantize_acts(att_.data(), n, static_cast<int64_t>(H) * D, xq_);
     matmul(L.wo, att_.data(), xq_.data(), n, h_.data());
@@ -291,10 +330,10 @@ void Model::forward(const int32_t* tokens, int n, int pos, float* logits, bool a
     add_residual(n);
   }
 
-  // Final norm and LM head for the last token (or all tokens for perplexity).
-  const int first = all_logits ? 0 : n - 1;
-  const int m = n - first;
-  for (int t = first; t < n; ++t) rmsnorm(h_.data() + (t - first) * E, x_.data() + t * E, output_norm_, E, c.rms_eps);
+  // Final norm and LM head for the tokens in out_.
+  const int m = static_cast<int>(out_.size());
+  if (m == 0) return;
+  for (int i = 0; i < m; ++i) rmsnorm(h_.data() + i * E, x_.data() + out_[i] * E, output_norm_, E, c.rms_eps);
   quantize_acts(h_.data(), m, E, xq_);
   matmul(output_, h_.data(), xq_.data(), m, logits);
   lap(7);
@@ -304,11 +343,11 @@ void Model::forward(const int32_t* tokens, int n, int pos, float* logits, bool a
 
 namespace malkin {
 
-void Model::move_kv(int from, int to) {
+void Model::move_kv(int from, int to, int seq) {
   if (from == to) return;
   const size_t row = static_cast<size_t>(cfg_.n_head_kv) * cfg_.head_dim;
   for (int il = 0; il < cfg_.n_layer; ++il) {
-    const size_t base = static_cast<size_t>(il) * n_ctx_;
+    const size_t base = static_cast<size_t>(il) * n_seq_ * n_ctx_ + static_cast<size_t>(seq) * n_ctx_;
     std::memcpy(kcache_.data() + (base + to) * row, kcache_.data() + (base + from) * row, row * sizeof(uint16_t));
     std::memcpy(vcache_.data() + (base + to) * row, vcache_.data() + (base + from) * row, row * sizeof(uint16_t));
   }

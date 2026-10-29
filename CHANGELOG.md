@@ -4,6 +4,7 @@
 
 - Q6_K wide (prefill) kernel: signed weights, activations + 128, the per-row shift preloaded into the integer accumulators, both 16-value halves scaled once per Q8 block.
 - Vectorized SiLU (`kern::silu_mul`), threaded residual adds.
+- Continuous batching: `serve --parallel N` (default 4) decodes concurrent requests in one forward pass per step, one KV sequence per slot with prefix reuse; 4B Q8_0 with 8 requests 100.07 tok/s vs llama-server 58.01. `tools/bench_parallel.sh`, `tools/check_parallel.sh`.
 - `bench_layers`: decode (n = 1) bandwidth over distinct packed weights larger than L3; Q8_0, Q4_K, Q6_K reach 59-61 GB/s on the 9800X3D.
 
 | pp512 tok/s, 9800X3D, 8 threads, best of 3 interleaved, host load 7-9 | 0.1.0 | now | llama.cpp |

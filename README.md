@@ -47,13 +47,24 @@ Four prompt types (explanation, code, list, summary), 200 greedy tokens each. ll
 
 **Against llama.cpp with its own draft** (`llama-speculative-simple --spec-type draft-simple`, same 0.6B Q4_K_M draft, greedy, same 4 prompts, best of draft length 4 / 8 / 16): Qwen3-8B Q8_0 10.32 tok/s, malkin + draft 15.95 tok/s, **1.55x** (`tools/bench_spec_llama.sh`).
 
+**Concurrent requests, continuous batching.** `serve` decodes up to `--parallel` requests (default 4) in one forward pass per step: every weight is read once for all of them. Greedy answers are byte-identical to one request at a time (`tools/check_parallel.sh`).
+
+| Qwen3, aggregate tokens/s, N requests of 128 tokens at once | slots | llama-server | malkin | |
+| --- | ---: | ---: | ---: | ---: |
+| 4B Q8_0, N = 1 | 4 | 12.83 | 14.01 | 1.09x |
+| 4B Q8_0, N = 4 | 4 | 40.96 | **53.61** | **1.31x** |
+| 4B Q8_0, N = 8 | 8 | 58.01 | **100.07** | **1.73x** |
+| 14B Q6_K, N = 4 | 4 | 16.98 | **19.88** | **1.17x** |
+
+<!-- [PROV: date=2026-10-29 hw=Ryzen7-9800X3D WSL2 branch=parallel-slots cmd=`tools/bench_parallel.sh URL N 128` against `malkin serve --ctx 4096 --parallel S` and `llama-server -t 8 -np S -c 4096*S` (ghcr.io/ggml-org/llama.cpp:full), interleaved, best of 2 (14B: 1 round), host load 5] -->
+
 ### Where malkin loses, and what it is not
 
 - **Two ISAs.** No AVX2-only x86, no Apple, no SVE paths yet (Neoverse-V1/V2 run the N1 kernels).
 - **Q6_K prompt reading** is 1.44x llama.cpp, not 2x: its scale per 16 weights needs a float multiply per 4 `vpdpbusd` on the same ports (one core: 0.43 TMAC/s, 0.51 in an ablation build without scales).
 - **Answers without a draft model** are level with llama.cpp: memory bandwidth, not compute, sets the pace. llama.cpp can run a draft model too; the tables compare both engines on their defaults.
 - **One architecture:** Qwen3 dense (`qwen3`). No MoE, no vision, no tool calls yet.
-- **One sequence at a time**, with prefix reuse; no batching of concurrent requests.
+- **Speculation is single-sequence:** with `--draft`, a request decodes speculatively only while it is the only one in flight; concurrent requests are batched without the draft.
 - **Neoverse numbers are emulated** (`qemu -cpu neoverse-n1`): correct, not benchmarked on hardware.
 
 ## Quick start

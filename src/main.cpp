@@ -27,7 +27,8 @@ options:
   --model PATH      GGUF file
   --host ADDR       listen address (default 0.0.0.0)
   --port N          listen port (default 8080)
-  --ctx N           context length (default: auto from RAM, max 32768)
+  --ctx N           context length per sequence (default: auto from RAM, max 32768)
+  --parallel N      requests decoded together (serve, default 4; others 1)
   --threads N       decode threads (default: physical cores)
   --threads-batch N prefill threads (default: same as --threads)
   --draft PATH      draft GGUF for speculative decoding (same tokenizer, e.g. Qwen3-0.6B for Qwen3)
@@ -44,7 +45,7 @@ options:
 struct Args {
   std::string cmd = "serve", model, host = "0.0.0.0", prompt, file;
   std::string draft;
-  int n_draft = 0;
+  int n_draft = 0, parallel = 0;
   int port = 8080, ctx = 0, threads = 0, threads_batch = 0, n = 512, pp = 512, tg = 128, window = 512;
   float temp = 0.0f;
   bool think = true;
@@ -82,6 +83,8 @@ Args parse(int argc, char** argv) {
       a.think = false;
     else if (s == "--draft")
       a.draft = val("--draft");
+    else if (s == "--parallel" || s == "-np")
+      a.parallel = std::stoi(val("--parallel"));
     else if (s == "--n-draft")
       a.n_draft = std::stoi(val("--n-draft"));
     else if (s == "-pp")
@@ -166,7 +169,13 @@ int main(int argc, char** argv) {
           cpu_model_name().c_str(), miss.c_str());
       return 3;
     }
-    EngineOptions o{a.model, a.ctx, a.threads, a.threads_batch, a.draft, a.n_draft};
+    EngineOptions o{a.model,
+                    a.ctx,
+                    a.threads,
+                    a.threads_batch,
+                    a.draft,
+                    a.n_draft,
+                    a.parallel > 0 ? a.parallel : a.cmd == "serve" ? 4 : 1};
     if (a.cmd == "ppl" && a.ctx == 0) o.n_ctx = a.window;
     Engine e(o);
     if (a.cmd == "serve") return serve(e, a.host, a.port);
