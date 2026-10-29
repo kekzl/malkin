@@ -45,6 +45,8 @@ Prompt = 512-token prefill, answer = 32-token generation, same GGUF file in both
 
 Four prompt types (explanation, code, list, summary), 200 greedy tokens each. llama.cpp column: `llama-bench` generation on its defaults (no draft). The 0.6B draft fits the original Qwen3 release (8B) better than the newer 4B-Instruct-2507 post-training (one-prompt runs: 55 % vs 47 % of drafts accepted). Draft from the Hugging Face weights: `llama.cpp:full --convert --outtype q8_0 Qwen3-0.6B`, then `--quantize ... Q4_K_M`.
 
+**Against llama.cpp with its own draft** (`llama-speculative-simple --spec-type draft-simple`, same 0.6B Q4_K_M draft, greedy, same 4 prompts, best of draft length 4 / 8 / 16): Qwen3-8B Q8_0 10.32 tok/s, malkin + draft 15.95 tok/s, **1.55x** (`tools/bench_spec_llama.sh`).
+
 ### Where malkin loses, and what it is not
 
 - **Two ISAs.** No AVX2-only x86, no Apple, no SVE paths yet (Neoverse-V1/V2 run the N1 kernels).
