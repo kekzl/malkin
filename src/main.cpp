@@ -30,6 +30,8 @@ options:
   --ctx N           context length (default: auto from RAM, max 32768)
   --threads N       decode threads (default: physical cores)
   --threads-batch N prefill threads (default: same as --threads)
+  --draft PATH      draft GGUF for speculative decoding (same tokenizer, e.g. Qwen3-0.6B for Qwen3)
+  --n-draft N       max draft tokens per step (default 8)
   -p TEXT           prompt (run)
   -n N              max new tokens (run, default 512)
   --temp F          temperature (run, default 0 = greedy)
@@ -41,6 +43,8 @@ options:
 
 struct Args {
   std::string cmd = "serve", model, host = "0.0.0.0", prompt, file;
+  std::string draft;
+  int n_draft = 0;
   int port = 8080, ctx = 0, threads = 0, threads_batch = 0, n = 512, pp = 512, tg = 128, window = 512;
   float temp = 0.0f;
   bool think = true;
@@ -66,6 +70,8 @@ Args parse(int argc, char** argv) {
     else if (s == "-n") a.n = std::stoi(val("-n"));
     else if (s == "--temp") a.temp = std::stof(val("--temp"));
     else if (s == "--no-think") a.think = false;
+    else if (s == "--draft") a.draft = val("--draft");
+    else if (s == "--n-draft") a.n_draft = std::stoi(val("--n-draft"));
     else if (s == "-pp") a.pp = std::stoi(val("-pp"));
     else if (s == "-tg") a.tg = std::stoi(val("-tg"));
     else if (s == "-f") a.file = val("-f");
@@ -89,6 +95,7 @@ int run(Engine& e, const Args& a) {
   std::fprintf(stderr, "\n[prompt %d tok, %.1f tok/s | gen %d tok, %.1f tok/s | %s]\n", r.prompt_tokens,
                r.prompt_tokens * 1000.0 / r.prefill_ms, r.completion_tokens, r.completion_tokens * 1000.0 / r.decode_ms,
                r.finish_reason.c_str());
+  if (r.drafted) std::fprintf(stderr, "[draft: %d proposed, %d accepted (%.1f %%)]\n", r.drafted, r.accepted, 100.0 * r.accepted / r.drafted);
   return 0;
 }
 
@@ -135,7 +142,7 @@ int main(int argc, char** argv) {
                    cpu_model_name().c_str(), miss.c_str());
       return 3;
     }
-    EngineOptions o{a.model, a.ctx, a.threads, a.threads_batch};
+    EngineOptions o{a.model, a.ctx, a.threads, a.threads_batch, a.draft, a.n_draft};
     if (a.cmd == "ppl" && a.ctx == 0) o.n_ctx = a.window;
     Engine e(o);
     if (a.cmd == "serve") return serve(e, a.host, a.port);

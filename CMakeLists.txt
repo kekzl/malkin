@@ -71,5 +71,8 @@ add_executable(test_quant tests/test_quant.cpp)
 target_link_libraries(test_quant PRIVATE malkin_core)
 add_test(NAME quant COMMAND test_quant)
 set_tests_properties(quant PROPERTIES SKIP_RETURN_CODE 77)
+add_executable(test_sampler tests/test_sampler.cpp)
+target_link_libraries(test_sampler PRIVATE malkin_core)
+add_test(NAME sampler COMMAND test_sampler)
 
 install(TARGETS malkin RUNTIME DESTINATION bin)

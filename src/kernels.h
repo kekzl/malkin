@@ -38,6 +38,12 @@ float dot_q6_k(int64_t k, const uint8_t* w, const BlockQ8* x);
 float dot_f32_bf16(const float* q, const uint16_t* k, int n);
 void axpy_bf16(float a, const uint16_t* v, float* y, int n);
 
+// Causal attention of one query token for the G query heads sharing one KV head (GQA).
+// q: G x D floats; keys/values 0..n-1 at k + j * stride, v + j * stride (BF16); out: G x D.
+// scratch: at least G * n floats. D is a multiple of 16.
+void attend_gqa(const float* q, int G, int D, const uint16_t* k, const uint16_t* v, size_t stride, int n, float scale,
+                float* out, float* scratch);
+
 // Panel GEMM. A panel holds panel_rows() weight rows interleaved for the ISA's dot instruction.
 int panel_rows();
 // Two panel formats: compact (about the GGUF size, all n) and wide (one byte per weight, unpacked at load, for

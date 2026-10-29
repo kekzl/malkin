@@ -154,7 +154,9 @@ json timings_json(const GenResult& r) {
           {"prompt_per_second", r.prefill_ms > 0 ? prefilled * 1000.0 / r.prefill_ms : 0.0},
           {"predicted_n", r.completion_tokens},
           {"predicted_ms", r.decode_ms},
-          {"predicted_per_second", r.decode_ms > 0 ? r.completion_tokens * 1000.0 / r.decode_ms : 0.0}};
+          {"predicted_per_second", r.decode_ms > 0 ? r.completion_tokens * 1000.0 / r.decode_ms : 0.0},
+          {"draft_n", r.drafted},
+          {"draft_n_accepted", r.accepted}};
 }
 
 void log_request(const char* path, const GenResult& r) {

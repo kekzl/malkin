@@ -1,6 +1,9 @@
 // AArch64: NEON + dotprod + fp16 (Armv8.2-A, Neoverse-N1 baseline).
 #include <arm_neon.h>
 
+#include <algorithm>
+#include <cmath>
+
 #include "kernels.h"
 
 namespace malkin::kern {
@@ -185,5 +188,23 @@ size_t panel_bytes(GgmlType, int64_t, bool) { return 0; }
 void pack_panel(GgmlType, bool, const uint8_t*, size_t, int, int64_t, uint8_t*) {}
 int gemm_tile(GgmlType, bool) { return 1; }
 void gemm_panels(GgmlType, bool, const uint8_t*, size_t, int, int64_t, const BlockQ8*, int, float*, int64_t, int) {}
+
+}  // namespace malkin::kern
+
+namespace malkin::kern {
+
+void attend_gqa(const float* q, int G, int D, const uint16_t* k, const uint16_t* v, size_t stride, int n, float scale,
+                float* out, float* scratch) {
+  for (int h = 0; h < G; ++h) {
+    float* s = scratch + static_cast<size_t>(h) * n;
+    float mx = -INFINITY;
+    for (int j = 0; j < n; ++j) mx = std::max(mx, s[j] = dot_f32_bf16(q + h * D, k + j * stride, D) * scale);
+    float sum = 0.0f;
+    for (int j = 0; j < n; ++j) sum += s[j] = std::exp(s[j] - mx);
+    float* o = out + h * D;
+    for (int d = 0; d < D; ++d) o[d] = 0.0f;
+    for (int j = 0; j < n; ++j) axpy_bf16(s[j] / sum, v + j * stride, o, D);
+  }
+}
 
 }  // namespace malkin::kern

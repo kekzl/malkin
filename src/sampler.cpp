@@ -5,14 +5,28 @@
 
 namespace malkin {
 
-Sampler::Sampler(const SamplingParams& p) : p_(p), rng_(p.seed ? p.seed : std::random_device{}()) {}
+namespace {
 
-int32_t Sampler::sample(float* logits, int n_vocab) {
-  for (auto [id, cnt] : counts_) {
-    logits[id] -= p_.presence_penalty + p_.frequency_penalty * static_cast<float>(cnt);
+float prob_of(const Dist& d, int32_t id) {
+  for (const auto& [p, i] : d) {
+    if (i == id) return p;
+  }
+  return 0.0f;
+}
+
+}  // namespace
+
+Sampler::Sampler(const SamplingParams& p, bool penalties)
+    : p_(p), penalties_(penalties), rng_(p.seed ? p.seed : std::random_device{}()) {}
+
+void Sampler::distribution(float* logits, int n_vocab, Dist& out) {
+  out.clear();
+  if (penalties_) {
+    for (auto [id, cnt] : counts_) logits[id] -= p_.presence_penalty + p_.frequency_penalty * static_cast<float>(cnt);
   }
   if (p_.temperature <= 0.0f) {
-    return static_cast<int32_t>(std::max_element(logits, logits + n_vocab) - logits);
+    out.emplace_back(1.0f, static_cast<int32_t>(std::max_element(logits, logits + n_vocab) - logits));
+    return;
   }
   cand_.clear();
   cand_.reserve(n_vocab);
@@ -40,15 +54,46 @@ int32_t Sampler::sample(float* logits, int n_vocab) {
       break;
     }
   }
-  cand_.resize(std::max<size_t>(n, 1));
+  n = std::max<size_t>(n, 1);
   double total = 0;
-  for (auto& c : cand_) total += c.first;
-  double r = std::uniform_real_distribution<double>(0.0, total)(rng_);
-  for (auto& c : cand_) {
-    r -= c.first;
-    if (r <= 0) return c.second;
+  for (size_t i = 0; i < n; ++i) total += cand_[i].first;
+  out.assign(cand_.begin(), cand_.begin() + static_cast<ptrdiff_t>(n));
+  for (auto& c : out) c.first = static_cast<float>(c.first / total);
+}
+
+int32_t Sampler::draw(const Dist& d) {
+  if (d.size() == 1) return d[0].second;
+  double r = std::uniform_real_distribution<double>(0.0, 1.0)(rng_);
+  for (const auto& [p, id] : d) {
+    r -= p;
+    if (r <= 0) return id;
   }
-  return cand_.back().second;
+  return d.back().second;
+}
+
+int32_t Sampler::sample(float* logits, int n_vocab) {
+  Dist d;
+  distribution(logits, n_vocab, d);
+  return draw(d);
+}
+
+int32_t Sampler::verify(const Dist& p, const Dist& q, int32_t d, bool& accepted) {
+  const float pd = prob_of(p, d), qd = prob_of(q, d);
+  const double u = std::uniform_real_distribution<double>(0.0, 1.0)(rng_);
+  accepted = qd > 0.0f && u * qd < pd;  // u < pd / qd
+  if (accepted) return d;
+  Dist resid;
+  double total = 0;
+  for (const auto& [pp, id] : p) {
+    const float r = pp - prob_of(q, id);
+    if (r > 0.0f) {
+      resid.emplace_back(r, id);
+      total += r;
+    }
+  }
+  if (resid.empty()) return draw(p);  // p == q up to rounding
+  for (auto& c : resid) c.first = static_cast<float>(c.first / total);
+  return draw(resid);
 }
 
 }  // namespace malkin

@@ -57,6 +57,19 @@ Engine::Engine(const EngineOptions& o) {
   tok_ = std::make_unique<Tokenizer>(*file_);
   chat_ = std::make_unique<ChatFormat>(*tok_, file_->get_str("tokenizer.chat_template").value_or(""));
   model_ = std::make_unique<Model>(*file_, n_ctx);
+  if (!o.draft_path.empty()) {
+    dfile_ = std::make_unique<GgufFile>(o.draft_path);
+    Tokenizer dtok(*dfile_);
+    bool same = dtok.size() == tok_->size();
+    for (int32_t id : {0, 1000, 100000, static_cast<int32_t>(tok_->size()) - 1}) same = same && dtok.piece(id) == tok_->piece(id);
+    if (!same) throw std::runtime_error("draft model tokenizer differs from the target");
+    draft_ = std::make_unique<Model>(*dfile_, n_ctx);
+    dlogits_.resize(static_cast<size_t>(draft_->cfg().n_vocab));
+    if (o.n_draft > 0) n_draft_ = std::min(o.n_draft, Model::kMaxBatch - 1);
+    vlogits_.resize(static_cast<size_t>(n_draft_ + 1) * model_->cfg().n_vocab);
+    std::fprintf(stderr, "malkin: draft %s, %d layers, up to %d tokens per step\n",
+                 std::filesystem::path(o.draft_path).stem().c_str(), draft_->cfg().n_layer, n_draft_);
+  }
   logits_.resize(static_cast<size_t>(cfg.n_vocab));
   worker_ = std::thread([this] { worker_loop(); });
   on_worker([this] {
@@ -114,10 +127,23 @@ GenResult Engine::generate(const GenRequest& req, const OnText& on_text) {
   return on_worker([&] { return generate_locked(req, on_text); });
 }
 
+void Engine::draft_sync(const std::vector<int32_t>& ctx) {
+  size_t common = 0;
+  while (common < dcache_.size() && common < ctx.size() && dcache_[common] == ctx[common]) ++common;
+  common = std::min(common, ctx.size() - 1);
+  dcache_.resize(common);
+  for (size_t i = common; i < ctx.size(); i += Model::kMaxBatch) {
+    const int n = static_cast<int>(std::min<size_t>(Model::kMaxBatch, ctx.size() - i));
+    draft_->forward(ctx.data() + i, n, static_cast<int>(i), dlogits_.data(), false);
+  }
+  dcache_ = ctx;
+}
+
 GenResult Engine::generate_locked(const GenRequest& req, const OnText& on_text) {
   GenResult r;
   const auto& prompt = req.prompt;
   const int n_ctx = model_->n_ctx();
+  const int n_vocab = model_->cfg().n_vocab;
   if (prompt.empty()) throw std::invalid_argument("empty prompt");
   if (static_cast<int>(prompt.size()) >= n_ctx) {
     throw std::invalid_argument("prompt has " + std::to_string(prompt.size()) + " tokens, context is " +
@@ -144,16 +170,16 @@ GenResult Engine::generate_locked(const GenRequest& req, const OnText& on_text) 
   auto t1 = Clock::now();
   r.finish_reason = "length";
   bool cancelled = false;
-  while (r.completion_tokens < budget) {
-    int32_t id = sampler.sample(logits_.data(), model_->cfg().n_vocab);
+
+  // Appends one generated token; false = generation ends (EOG, stop string, budget, cancel).
+  auto emit = [&](int32_t id) {
     if (tok_->is_eog(id)) {
       r.finish_reason = "stop";
-      break;
+      return false;
     }
     sampler.accept(id);
     ++r.completion_tokens;
     text += tok_->piece(id);
-
     size_t stop_at = std::string::npos;
     for (const auto& s : req.stop) {
       if (s.empty()) continue;
@@ -181,10 +207,73 @@ GenResult Engine::generate_locked(const GenRequest& req, const OnText& on_text) 
       if (on_text && !on_text(text.substr(emitted, safe - emitted))) cancelled = true;
       emitted = safe;
     }
-    if (stop_at != std::string::npos || cancelled) break;
-    if (static_cast<int>(cache_.size()) >= n_ctx) break;
-    model_->forward(&id, 1, static_cast<int>(cache_.size()), logits_.data(), false);
-    cache_.push_back(id);
+    if (stop_at != std::string::npos || cancelled) return false;
+    if (r.completion_tokens >= budget) return false;
+    return static_cast<int>(cache_.size()) + 1 < n_ctx;
+  };
+
+  int32_t next = sampler.sample(logits_.data(), n_vocab);
+  if (!draft_) {
+    while (emit(next)) {
+      model_->forward(&next, 1, static_cast<int>(cache_.size()), logits_.data(), false);
+      cache_.push_back(next);
+      next = sampler.sample(logits_.data(), n_vocab);
+    }
+  } else {
+    // Speculative decoding. Invariant: cache_ holds the tokens with target KV; next is sampled, not in KV.
+    SamplingParams dp = req.sampling;
+    dp.seed = dp.seed ? dp.seed + 1 : 0;
+    Sampler dsampler(dp, false);
+    std::vector<int32_t> batch;
+    std::vector<Dist> qd;
+    Dist p;
+    int k = std::min(4, n_draft_);
+    bool go = emit(next);
+    while (go) {
+      // Draft up to k tokens after cache_ + next (no further than the budget and context allow).
+      const int room = std::min(budget - r.completion_tokens, n_ctx - static_cast<int>(cache_.size()) - 2);
+      const int kk = std::max(0, std::min(k, room));
+      batch.assign(1, next);
+      qd.resize(kk);
+      if (kk > 0) {
+        std::vector<int32_t> ctx = cache_;
+        ctx.push_back(next);
+        draft_sync(ctx);
+        for (int i = 0; i < kk; ++i) {
+          dsampler.distribution(dlogits_.data(), draft_->cfg().n_vocab, qd[i]);
+          const int32_t d = dsampler.draw(qd[i]);
+          batch.push_back(d);
+          if (i + 1 < kk) {
+            draft_->forward(&d, 1, static_cast<int>(dcache_.size()), dlogits_.data(), false);
+            dcache_.push_back(d);
+          }
+        }
+      }
+      // One target pass over next + drafts: logits for every position.
+      const int nb = static_cast<int>(batch.size());
+      model_->forward(batch.data(), nb, static_cast<int>(cache_.size()), vlogits_.data(), true);
+      cache_.push_back(next);
+      r.drafted += nb - 1;
+      int i = 0;
+      for (; i < nb - 1; ++i) {
+        sampler.distribution(vlogits_.data() + static_cast<size_t>(i) * n_vocab, n_vocab, p);
+        bool ok = false;
+        const int32_t t = sampler.verify(p, qd[i], batch[i + 1], ok);
+        if (!ok) {
+          next = t;
+          break;
+        }
+        ++r.accepted;
+        cache_.push_back(t);
+        if (!(go = emit(t))) break;
+      }
+      if (!go) break;
+      if (i == nb - 1) next = sampler.sample(vlogits_.data() + static_cast<size_t>(nb - 1) * n_vocab, n_vocab);
+      // Adapt the draft length: grow after a fully accepted step, shrink when most drafts fail.
+      if (i == nb - 1 && nb - 1 == k) k = std::min(k + 1, n_draft_);
+      else if (2 * i < nb - 1) k = std::max(1, k - 1);
+      go = emit(next);
+    }
   }
   if (cancelled) r.finish_reason = "cancelled";
   if (!cancelled && emitted < text.size() && on_text) on_text(text.substr(emitted));

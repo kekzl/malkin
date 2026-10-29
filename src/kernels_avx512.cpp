@@ -1,6 +1,8 @@
 // x86-64: AVX-512 (F, BW, VL, DQ) + VNNI.
 #include <immintrin.h>
 
+#include <cmath>
+
 #include "kernels.h"
 
 namespace malkin::kern {
@@ -172,6 +174,107 @@ float dot_f32_bf16(const float* q, const uint16_t* k, int n) {
 void axpy_bf16(float a, const uint16_t* v, float* y, int n) {
   const __m512 av = _mm512_set1_ps(a);
   for (int d = 0; d < n; d += 16) _mm512_storeu_ps(y + d, _mm512_fmadd_ps(av, load_bf16(v + d), _mm512_loadu_ps(y + d)));
+}
+
+namespace {
+
+// e^x for x <= 0 (softmax after max subtraction): Cody-Waite range reduction, degree-6 Taylor, rel err ~1e-7.
+inline __m512 exp512(__m512 x) {
+  x = _mm512_max_ps(x, _mm512_set1_ps(-87.0f));
+  const __m512 n = _mm512_roundscale_ps(_mm512_mul_ps(x, _mm512_set1_ps(1.44269504088896341f)),
+                                        _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+  __m512 r = _mm512_fnmadd_ps(n, _mm512_set1_ps(0.693145751953125f), x);
+  r = _mm512_fnmadd_ps(n, _mm512_set1_ps(1.42860682030941723e-6f), r);
+  __m512 p = _mm512_set1_ps(1.0f / 720.0f);
+  p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f / 120.0f));
+  p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f / 24.0f));
+  p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f / 6.0f));
+  p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(0.5f));
+  p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f));
+  p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f));
+  return _mm512_scalef_ps(p, n);
+}
+
+// s[i] = exp(s[i] - max(s)), returns 1 / sum.
+float softmax_inplace(float* s, int n) {
+  __m512 m = _mm512_set1_ps(-INFINITY);
+  int i = 0;
+  for (; i + 16 <= n; i += 16) m = _mm512_max_ps(m, _mm512_loadu_ps(s + i));
+  if (i < n) m = _mm512_mask_max_ps(m, static_cast<__mmask16>((1u << (n - i)) - 1), m, _mm512_maskz_loadu_ps(static_cast<__mmask16>((1u << (n - i)) - 1), s + i));
+  const __m512 mx = _mm512_set1_ps(_mm512_reduce_max_ps(m));
+  __m512 sum = _mm512_setzero_ps();
+  for (i = 0; i + 16 <= n; i += 16) {
+    const __m512 e = exp512(_mm512_sub_ps(_mm512_loadu_ps(s + i), mx));
+    _mm512_storeu_ps(s + i, e);
+    sum = _mm512_add_ps(sum, e);
+  }
+  if (i < n) {
+    const auto k = static_cast<__mmask16>((1u << (n - i)) - 1);
+    const __m512 e = exp512(_mm512_sub_ps(_mm512_maskz_loadu_ps(k, s + i), mx));
+    _mm512_mask_storeu_ps(s + i, k, e);
+    sum = _mm512_mask_add_ps(sum, k, sum, e);
+  }
+  return 1.0f / _mm512_reduce_add_ps(sum);
+}
+
+template <int DC>
+void attend_t(const float* q, int G, const uint16_t* k, const uint16_t* v, size_t stride, int n, float scale, float* out,
+              float* sc) {
+  constexpr int D = DC * 16;
+  constexpr int HP = DC <= 8 ? 2 : 1;  // heads per PV pass: HP x DC accumulators stay in registers
+  for (int j = 0; j < n; ++j) {
+    const uint16_t* kr = k + j * stride;
+    __m512 kf[DC];
+    for (int d = 0; d < DC; ++d) kf[d] = load_bf16(kr + 16 * d);
+    for (int h = 0; h < G; ++h) {
+      __m512 s = _mm512_mul_ps(_mm512_loadu_ps(q + h * D), kf[0]);
+      for (int d = 1; d < DC; ++d) s = _mm512_fmadd_ps(_mm512_loadu_ps(q + h * D + 16 * d), kf[d], s);
+      sc[h * n + j] = _mm512_reduce_add_ps(s) * scale;
+    }
+  }
+  float inv[16];
+  for (int h = 0; h < G; ++h) inv[h] = softmax_inplace(sc + h * n, n);
+  for (int h0 = 0; h0 < G; h0 += HP) {
+    const int hp = G - h0 < HP ? G - h0 : HP;
+    __m512 acc[HP][DC];
+    for (int hh = 0; hh < HP; ++hh)
+      for (int d = 0; d < DC; ++d) acc[hh][d] = _mm512_setzero_ps();
+    for (int j = 0; j < n; ++j) {
+      const uint16_t* vr = v + j * stride;
+      __m512 pj[HP];
+      for (int hh = 0; hh < HP; ++hh) pj[hh] = _mm512_set1_ps(hh < hp ? sc[(h0 + hh) * n + j] : 0.0f);
+      for (int d = 0; d < DC; ++d) {
+        const __m512 vf = load_bf16(vr + 16 * d);
+        for (int hh = 0; hh < HP; ++hh) acc[hh][d] = _mm512_fmadd_ps(pj[hh], vf, acc[hh][d]);
+      }
+    }
+    for (int hh = 0; hh < hp; ++hh) {
+      const __m512 iv = _mm512_set1_ps(inv[h0 + hh]);
+      for (int d = 0; d < DC; ++d) _mm512_storeu_ps(out + (h0 + hh) * D + 16 * d, _mm512_mul_ps(acc[hh][d], iv));
+    }
+  }
+}
+
+}  // namespace
+
+void attend_gqa(const float* q, int G, int D, const uint16_t* k, const uint16_t* v, size_t stride, int n, float scale,
+                float* out, float* scratch) {
+  if (G <= 16) {
+    switch (D) {
+      case 64: return attend_t<4>(q, G, k, v, stride, n, scale, out, scratch);
+      case 128: return attend_t<8>(q, G, k, v, stride, n, scale, out, scratch);
+      case 256: return attend_t<16>(q, G, k, v, stride, n, scale, out, scratch);
+      default: break;
+    }
+  }
+  for (int h = 0; h < G; ++h) {  // other head sizes: one head at a time
+    float* s = scratch + static_cast<size_t>(h) * n;
+    for (int j = 0; j < n; ++j) s[j] = dot_f32_bf16(q + h * D, k + j * stride, D) * scale;
+    const float iv = softmax_inplace(s, n);
+    float* o = out + h * D;
+    for (int d = 0; d < D; ++d) o[d] = 0.0f;
+    for (int j = 0; j < n; ++j) axpy_bf16(s[j] * iv, v + j * stride, o, D);
+  }
 }
 
 }  // namespace malkin::kern
