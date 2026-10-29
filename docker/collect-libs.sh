@@ -10,6 +10,7 @@ need() { llvm-readelf-"$LLVM" -d "$1" | sed -n 's/.*Shared library: \[\(.*\)\]/\
 queue=$(need "$bin")
 seen=""
 while [ -n "$queue" ]; do
+  # shellcheck disable=SC2086  # split the space-separated queue
   set -- $queue
   lib=$1; shift; queue="$*"
   case " $seen " in *" $lib "*) continue ;; esac

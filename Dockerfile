@@ -16,6 +16,7 @@ WORKDIR /src
 FROM deps AS build
 ARG TARGETARCH
 ARG BUILDARCH
+ARG VERSION=dev
 COPY CMakeLists.txt .
 COPY cmake cmake
 COPY docker docker
@@ -24,12 +25,28 @@ COPY tests tests
 RUN set -e; tc=""; triple=x86_64-linux-gnu; \
     if [ "$TARGETARCH" = arm64 ]; then triple=aarch64-linux-gnu; fi; \
     if [ "$TARGETARCH" != "$BUILDARCH" ]; then tc="-DCMAKE_TOOLCHAIN_FILE=cmake/aarch64-linux-gnu.cmake"; fi; \
-    cmake -B build -G Ninja $tc && cmake --build build; \
+    cmake -B build -G Ninja $tc -DMALKIN_VERSION_STRING="$VERSION" && cmake --build build; \
     mkdir -p /out && cp build/malkin /out/ && sh docker/collect-libs.sh build/malkin /out/lib $triple
 
 # Runs the kernel tests (through qemu for arm64): docker build --target test .
 FROM build AS test
 RUN ctest --test-dir build --output-on-failure
+
+# Release tarball: bin/malkin launcher, libexec/malkin, lib/ (libc++, libomp). glibc and PCRE2 come from the host.
+# docker buildx build --platform linux/arm64 --target bundle --build-arg VERSION=0.2.0 -o dist .
+FROM build AS bundle-build
+ARG VERSION=dev
+ARG TARGETARCH
+COPY LICENSE README.md ./
+RUN set -e; a=x86_64; [ "$TARGETARCH" = arm64 ] && a=aarch64; d=malkin-$VERSION-linux-$a; \
+    mkdir -p /dist/$d/bin /dist/$d/lib /dist/$d/libexec; \
+    cp /out/malkin /dist/$d/libexec/; cp /out/lib/* /dist/$d/lib/; cp LICENSE README.md /dist/$d/; \
+    printf '#!/bin/sh\nd=$(dirname "$(readlink -f "$0")")/..\nLD_LIBRARY_PATH="$d/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" exec "$d/libexec/malkin" "$@"\n' > /dist/$d/bin/malkin; \
+    chmod +x /dist/$d/bin/malkin; \
+    tar -C /dist -czf /dist/$d.tar.gz $d && (cd /dist && sha256sum $d.tar.gz > $d.tar.gz.sha256) && rm -rf /dist/$d
+
+FROM scratch AS bundle
+COPY --from=bundle-build /dist/ /
 
 # COPY only, no RUN: the target-arch stage never executes code at build time.
 FROM debian:trixie-slim AS runtime

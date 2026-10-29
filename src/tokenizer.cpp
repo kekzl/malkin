@@ -60,7 +60,8 @@ uint32_t next_cp(const std::string& s, size_t& i) {
 
 Tokenizer::Tokenizer(const GgufFile& f) {
   auto model = f.get_str("tokenizer.ggml.model").value_or("");
-  if (model != "gpt2") throw std::runtime_error("tokenizer model '" + model + "' unsupported (need gpt2 byte-level BPE)");
+  if (model != "gpt2")
+    throw std::runtime_error("tokenizer model '" + model + "' unsupported (need gpt2 byte-level BPE)");
   auto* toks = f.get_str_array("tokenizer.ggml.tokens");
   auto* merges = f.get_str_array("tokenizer.ggml.merges");
   if (!toks || !merges) throw std::runtime_error("tokenizer: tokens or merges missing");

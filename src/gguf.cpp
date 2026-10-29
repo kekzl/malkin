@@ -13,22 +13,38 @@ namespace malkin {
 
 const char* ggml_type_name(GgmlType t) {
   switch (t) {
-    case GgmlType::F32: return "F32";
-    case GgmlType::F16: return "F16";
-    case GgmlType::BF16: return "BF16";
-    case GgmlType::Q4_0: return "Q4_0";
-    case GgmlType::Q4_1: return "Q4_1";
-    case GgmlType::Q5_0: return "Q5_0";
-    case GgmlType::Q5_1: return "Q5_1";
-    case GgmlType::Q8_0: return "Q8_0";
-    case GgmlType::Q8_1: return "Q8_1";
-    case GgmlType::Q2_K: return "Q2_K";
-    case GgmlType::Q3_K: return "Q3_K";
-    case GgmlType::Q4_K: return "Q4_K";
-    case GgmlType::Q5_K: return "Q5_K";
-    case GgmlType::Q6_K: return "Q6_K";
-    case GgmlType::Q8_K: return "Q8_K";
-    case GgmlType::MXFP4: return "MXFP4";
+    case GgmlType::F32:
+      return "F32";
+    case GgmlType::F16:
+      return "F16";
+    case GgmlType::BF16:
+      return "BF16";
+    case GgmlType::Q4_0:
+      return "Q4_0";
+    case GgmlType::Q4_1:
+      return "Q4_1";
+    case GgmlType::Q5_0:
+      return "Q5_0";
+    case GgmlType::Q5_1:
+      return "Q5_1";
+    case GgmlType::Q8_0:
+      return "Q8_0";
+    case GgmlType::Q8_1:
+      return "Q8_1";
+    case GgmlType::Q2_K:
+      return "Q2_K";
+    case GgmlType::Q3_K:
+      return "Q3_K";
+    case GgmlType::Q4_K:
+      return "Q4_K";
+    case GgmlType::Q5_K:
+      return "Q5_K";
+    case GgmlType::Q6_K:
+      return "Q6_K";
+    case GgmlType::Q8_K:
+      return "Q8_K";
+    case GgmlType::MXFP4:
+      return "MXFP4";
   }
   return "unknown";
 }
@@ -42,22 +58,37 @@ struct TypeTraits {
 
 TypeTraits traits(GgmlType t) {
   switch (t) {
-    case GgmlType::F32: return {1, 4};
-    case GgmlType::F16: return {1, 2};
-    case GgmlType::BF16: return {1, 2};
-    case GgmlType::Q4_0: return {32, 18};
-    case GgmlType::Q4_1: return {32, 20};
-    case GgmlType::Q5_0: return {32, 22};
-    case GgmlType::Q5_1: return {32, 24};
-    case GgmlType::Q8_0: return {32, 34};
-    case GgmlType::Q8_1: return {32, 36};
-    case GgmlType::Q2_K: return {256, 84};
-    case GgmlType::Q3_K: return {256, 110};
-    case GgmlType::Q4_K: return {256, 144};
-    case GgmlType::Q5_K: return {256, 176};
-    case GgmlType::Q6_K: return {256, 210};
-    case GgmlType::Q8_K: return {256, 292};
-    case GgmlType::MXFP4: return {32, 17};
+    case GgmlType::F32:
+      return {1, 4};
+    case GgmlType::F16:
+    case GgmlType::BF16:
+      return {1, 2};
+    case GgmlType::Q4_0:
+      return {32, 18};
+    case GgmlType::Q4_1:
+      return {32, 20};
+    case GgmlType::Q5_0:
+      return {32, 22};
+    case GgmlType::Q5_1:
+      return {32, 24};
+    case GgmlType::Q8_0:
+      return {32, 34};
+    case GgmlType::Q8_1:
+      return {32, 36};
+    case GgmlType::Q2_K:
+      return {256, 84};
+    case GgmlType::Q3_K:
+      return {256, 110};
+    case GgmlType::Q4_K:
+      return {256, 144};
+    case GgmlType::Q5_K:
+      return {256, 176};
+    case GgmlType::Q6_K:
+      return {256, 210};
+    case GgmlType::Q8_K:
+      return {256, 292};
+    case GgmlType::MXFP4:
+      return {32, 17};
   }
   throw std::runtime_error("unknown ggml type " + std::to_string(static_cast<uint32_t>(t)));
 }
@@ -94,14 +125,24 @@ enum : uint32_t { kU8, kI8, kU16, kI16, kU32, kI32, kF32, kBool, kStr, kArr, kU6
 
 int64_t read_int(Reader& r, uint32_t type) {
   switch (type) {
-    case kU8: return r.get<uint8_t>();
-    case kI8: return r.get<int8_t>();
-    case kU16: return r.get<uint16_t>();
-    case kI16: return r.get<int16_t>();
-    case kU32: return r.get<uint32_t>();
-    case kI32: return r.get<int32_t>();
-    case kU64: return static_cast<int64_t>(r.get<uint64_t>());
-    case kI64: return r.get<int64_t>();
+    case kU8:
+      return r.get<uint8_t>();
+    case kI8:
+      return r.get<int8_t>();
+    case kU16:
+      return r.get<uint16_t>();
+    case kI16:
+      return r.get<int16_t>();
+    case kU32:
+      return r.get<uint32_t>();
+    case kI32:
+      return r.get<int32_t>();
+    case kU64:
+      return static_cast<int64_t>(r.get<uint64_t>());
+    case kI64:
+      return r.get<int64_t>();
+    default:
+      break;
   }
   throw std::runtime_error("gguf: not an int type");
 }
@@ -111,10 +152,14 @@ bool is_int(uint32_t t) { return t <= kI32 || t == kU64 || t == kI64; }
 GgufValue read_value(Reader& r, uint32_t type) {
   if (is_int(type)) return read_int(r, type);
   switch (type) {
-    case kF32: return static_cast<double>(r.get<float>());
-    case kF64: return r.get<double>();
-    case kBool: return r.get<uint8_t>() != 0;
-    case kStr: return r.str();
+    case kF32:
+      return static_cast<double>(r.get<float>());
+    case kF64:
+      return r.get<double>();
+    case kBool:
+      return r.get<uint8_t>() != 0;
+    case kStr:
+      return r.str();
     case kArr: {
       auto et = r.get<uint32_t>();
       auto n = r.get<uint64_t>();
@@ -136,6 +181,8 @@ GgufValue read_value(Reader& r, uint32_t type) {
       }
       throw std::runtime_error("gguf: nested arrays unsupported");
     }
+    default:
+      break;
   }
   throw std::runtime_error("gguf: bad value type " + std::to_string(type));
 }

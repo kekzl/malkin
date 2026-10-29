@@ -41,14 +41,19 @@ uint16_t fp32_to_bf16(float f) {
   uint32_t u;
   std::memcpy(&u, &f, 4);
   if ((u & 0x7fffffff) > 0x7f800000) return static_cast<uint16_t>((u >> 16) | 64);  // quiet NaN
-  u += 0x7fff + ((u >> 16) & 1);  // round to nearest even
+  u += 0x7fff + ((u >> 16) & 1);                                                    // round to nearest even
   return static_cast<uint16_t>(u >> 16);
 }
 
 bool weight_type_supported(GgmlType t) {
   switch (t) {
-    case GgmlType::F32: case GgmlType::F16: case GgmlType::BF16:
-    case GgmlType::Q8_0: case GgmlType::Q4_K: case GgmlType::Q5_K: case GgmlType::Q6_K:
+    case GgmlType::F32:
+    case GgmlType::F16:
+    case GgmlType::BF16:
+    case GgmlType::Q8_0:
+    case GgmlType::Q4_K:
+    case GgmlType::Q5_K:
+    case GgmlType::Q6_K:
       return true;
     default:
       return false;
@@ -128,32 +133,51 @@ void quantize_row_q8(const float* x, BlockQ8* y, int64_t k) { kern::quantize_row
 void dequantize_row(GgmlType t, const void* src, float* dst, int64_t k) {
   auto* b = static_cast<const uint8_t*>(src);
   switch (t) {
-    case GgmlType::F32: std::memcpy(dst, src, k * 4); return;
+    case GgmlType::F32:
+      std::memcpy(dst, src, k * 4);
+      return;
     case GgmlType::F16:
       for (int64_t i = 0; i < k; ++i) dst[i] = fp16_to_fp32(ld16(b + 2 * i));
       return;
     case GgmlType::BF16:
       for (int64_t i = 0; i < k; ++i) dst[i] = bf16_to_fp32(ld16(b + 2 * i));
       return;
-    case GgmlType::Q8_0: dequant_q8_0(b, dst, k); return;
-    case GgmlType::Q4_K: dequant_q4_k(b, dst, k); return;
-    case GgmlType::Q5_K: dequant_q5_k(b, dst, k); return;
-    case GgmlType::Q6_K: dequant_q6_k(b, dst, k); return;
-    default: throw std::runtime_error(std::string("dequantize: unsupported type ") + ggml_type_name(t));
+    case GgmlType::Q8_0:
+      dequant_q8_0(b, dst, k);
+      return;
+    case GgmlType::Q4_K:
+      dequant_q4_k(b, dst, k);
+      return;
+    case GgmlType::Q5_K:
+      dequant_q5_k(b, dst, k);
+      return;
+    case GgmlType::Q6_K:
+      dequant_q6_k(b, dst, k);
+      return;
+    default:
+      throw std::runtime_error(std::string("dequantize: unsupported type ") + ggml_type_name(t));
   }
 }
 
 float vec_dot(GgmlType t, int64_t k, const void* w, const float* x, const BlockQ8* xq) {
   auto* b = static_cast<const uint8_t*>(w);
   switch (t) {
-    case GgmlType::F32: return kern::dot_f32(k, static_cast<const float*>(w), x);
-    case GgmlType::F16: return kern::dot_f16(k, static_cast<const uint16_t*>(w), x);
-    case GgmlType::BF16: return kern::dot_bf16(k, static_cast<const uint16_t*>(w), x);
-    case GgmlType::Q8_0: return kern::dot_q8_0(k, b, xq);
-    case GgmlType::Q4_K: return kern::dot_q4_k(k, b, xq);
-    case GgmlType::Q5_K: return kern::dot_q5_k(k, b, xq);
-    case GgmlType::Q6_K: return kern::dot_q6_k(k, b, xq);
-    default: throw std::runtime_error(std::string("vec_dot: unsupported type ") + ggml_type_name(t));
+    case GgmlType::F32:
+      return kern::dot_f32(k, static_cast<const float*>(w), x);
+    case GgmlType::F16:
+      return kern::dot_f16(k, static_cast<const uint16_t*>(w), x);
+    case GgmlType::BF16:
+      return kern::dot_bf16(k, static_cast<const uint16_t*>(w), x);
+    case GgmlType::Q8_0:
+      return kern::dot_q8_0(k, b, xq);
+    case GgmlType::Q4_K:
+      return kern::dot_q4_k(k, b, xq);
+    case GgmlType::Q5_K:
+      return kern::dot_q5_k(k, b, xq);
+    case GgmlType::Q6_K:
+      return kern::dot_q6_k(k, b, xq);
+    default:
+      throw std::runtime_error(std::string("vec_dot: unsupported type ") + ggml_type_name(t));
   }
 }
 

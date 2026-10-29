@@ -125,8 +125,8 @@ float dot_q8_0(int64_t k, const uint8_t* w, const BlockQ8* x) {
   float32x4_t acc = vdupq_n_f32(0);
   for (int64_t i = 0; i < k / 32; ++i, w += 34) {
     const int8_t* q = reinterpret_cast<const int8_t*>(w + 2);
-    int32x4_t p = vdotq_s32(vdotq_s32(vdupq_n_s32(0), vld1q_s8(q), vld1q_s8(x[i].qs)), vld1q_s8(q + 16),
-                            vld1q_s8(x[i].qs + 16));
+    int32x4_t p =
+        vdotq_s32(vdotq_s32(vdupq_n_s32(0), vld1q_s8(q), vld1q_s8(x[i].qs)), vld1q_s8(q + 16), vld1q_s8(x[i].qs + 16));
     acc = vfmaq_n_f32(acc, vcvtq_f32_s32(p), fp16_to_fp32(ld16(w)) * x[i].d);
   }
   return vaddvq_f32(acc);

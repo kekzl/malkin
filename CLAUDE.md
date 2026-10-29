@@ -20,7 +20,9 @@ Build and run only in Docker; the host has no compiler. Pass `--user $(id -u):$(
 | Runtime image | `docker build -t malkin:local .` (arm64: `docker buildx build --platform linux/arm64 --load ...`) |
 | API test | start `malkin:local --model /models/<file>.gguf` with `-p 127.0.0.1:18080:8080`, then `tests/api_smoke.sh http://127.0.0.1:18080` (14 checks; host port 8080 belongs to imp) |
 | Correctness | `malkin ppl --model M -f /models/ppl_4k.txt --window 512` vs `docker run --rm -v /home/kekz/models:/models:ro ghcr.io/ggml-org/llama.cpp:full --perplexity -m M -f /models/ppl_4k.txt -c 512` |
-| Speed | `malkin bench --model M -pp 512 -tg 128` vs `llama.cpp:full` with `--entrypoint /app/llama-bench -p 512 -n 128 -t 8` |
+| Speed | `tools/bench_vs_llama.sh HOST_GGUF 512 128 2` (prefill + decode, back to back); `tools/bench_decode.sh TARGET DRAFT` (4 prompts, plain vs draft vs llama.cpp tg128); `bench_gemm [n] [threads]` (kernel TMAC/s) |
+| Lint | `tools/lint.sh` in the deps image: clang-format, clang-tidy (bugprone, performance, warnings are errors), shellcheck; CI adds actionlint |
+| Release | publishing a GitHub release runs `.github/workflows/release.yml`: ghcr.io image amd64 + arm64 (SBOM, provenance, cosign) and signed tarballs (`--target bundle`) |
 
 Models live in `/home/kekz/models` (mount read-only at `/models`). Reference model: `Qwen3-4B-Instruct-2507-Q8_0.gguf`, PPL 18.0120 (llama.cpp 18.0256).
 

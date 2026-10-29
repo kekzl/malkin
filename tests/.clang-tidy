@@ -1,0 +1,8 @@
+# Tests and benchmarks: fixed seeds keep runs reproducible, main may throw (a failing test), argv via atoi.
+InheritParentConfig: true
+Checks: >
+  -bugprone-random-generator-seed,
+  -bugprone-exception-escape,
+  -bugprone-unchecked-string-to-number-conversion,
+  -bugprone-integer-division,
+  -bugprone-throwing-static-initialization

@@ -43,12 +43,20 @@ std::string cpu_model_name() {
     if (line.starts_with("CPU part")) {  // Arm: no model name, map the part number
       auto part = std::stoi(line.substr(p + 1), nullptr, 16);
       switch (part) {
-        case 0xd0c: return "Arm Neoverse-N1";
-        case 0xd40: return "Arm Neoverse-V1";
-        case 0xd49: return "Arm Neoverse-N2";
-        case 0xd4f: return "Arm Neoverse-V2";
-        case 0xd8e: return "Arm Neoverse-N3";
-        case 0xd84: return "Arm Neoverse-V3";
+        case 0xd0c:
+          return "Arm Neoverse-N1";
+        case 0xd40:
+          return "Arm Neoverse-V1";
+        case 0xd49:
+          return "Arm Neoverse-N2";
+        case 0xd4f:
+          return "Arm Neoverse-V2";
+        case 0xd8e:
+          return "Arm Neoverse-N3";
+        case 0xd84:
+          return "Arm Neoverse-V3";
+        default:
+          break;
       }
       return "Arm part " + line.substr(p + 2);
     }

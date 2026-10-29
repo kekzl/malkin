@@ -173,7 +173,8 @@ float dot_f32_bf16(const float* q, const uint16_t* k, int n) {
 
 void axpy_bf16(float a, const uint16_t* v, float* y, int n) {
   const __m512 av = _mm512_set1_ps(a);
-  for (int d = 0; d < n; d += 16) _mm512_storeu_ps(y + d, _mm512_fmadd_ps(av, load_bf16(v + d), _mm512_loadu_ps(y + d)));
+  for (int d = 0; d < n; d += 16)
+    _mm512_storeu_ps(y + d, _mm512_fmadd_ps(av, load_bf16(v + d), _mm512_loadu_ps(y + d)));
 }
 
 namespace {
@@ -200,7 +201,9 @@ float softmax_inplace(float* s, int n) {
   __m512 m = _mm512_set1_ps(-INFINITY);
   int i = 0;
   for (; i + 16 <= n; i += 16) m = _mm512_max_ps(m, _mm512_loadu_ps(s + i));
-  if (i < n) m = _mm512_mask_max_ps(m, static_cast<__mmask16>((1u << (n - i)) - 1), m, _mm512_maskz_loadu_ps(static_cast<__mmask16>((1u << (n - i)) - 1), s + i));
+  if (i < n)
+    m = _mm512_mask_max_ps(m, static_cast<__mmask16>((1u << (n - i)) - 1), m,
+                           _mm512_maskz_loadu_ps(static_cast<__mmask16>((1u << (n - i)) - 1), s + i));
   const __m512 mx = _mm512_set1_ps(_mm512_reduce_max_ps(m));
   __m512 sum = _mm512_setzero_ps();
   for (i = 0; i + 16 <= n; i += 16) {
@@ -218,11 +221,11 @@ float softmax_inplace(float* s, int n) {
 }
 
 template <int DC>
-void attend_t(const float* q, int G, const uint16_t* k, const uint16_t* v, size_t stride, int n0, const int* extra, int ne,
-              float scale, float* out, float* sc) {
+void attend_t(const float* q, int G, const uint16_t* k, const uint16_t* v, size_t stride, int n0, const int* extra,
+              int ne, float scale, float* out, float* sc) {
   constexpr int D = DC * 16;
   constexpr int HP = DC <= 8 ? 2 : 1;  // heads per PV pass: HP x DC accumulators stay in registers
-  const int n = n0 + ne;  // keys 0..n0-1, then extra[]
+  const int n = n0 + ne;               // keys 0..n0-1, then extra[]
   for (int j = 0; j < n; ++j) {
     const uint16_t* kr = k + static_cast<size_t>(j < n0 ? j : extra[j - n0]) * stride;
     __m512 kf[DC];
@@ -262,10 +265,14 @@ void attend_gqa(const float* q, int G, int D, const uint16_t* k, const uint16_t*
                 float* out, float* scratch, const int* extra, int ne) {
   if (G <= 16) {
     switch (D) {
-      case 64: return attend_t<4>(q, G, k, v, stride, n, extra, ne, scale, out, scratch);
-      case 128: return attend_t<8>(q, G, k, v, stride, n, extra, ne, scale, out, scratch);
-      case 256: return attend_t<16>(q, G, k, v, stride, n, extra, ne, scale, out, scratch);
-      default: break;
+      case 64:
+        return attend_t<4>(q, G, k, v, stride, n, extra, ne, scale, out, scratch);
+      case 128:
+        return attend_t<8>(q, G, k, v, stride, n, extra, ne, scale, out, scratch);
+      case 256:
+        return attend_t<16>(q, G, k, v, stride, n, extra, ne, scale, out, scratch);
+      default:
+        break;
     }
   }
   const int nk = n + ne;

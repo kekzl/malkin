@@ -39,7 +39,8 @@ int main() {
     double tv = 0;
     for (const auto& [pp, id] : p) tv += std::fabs(hist[id] / N - pp);
     tv /= 2;
-    std::printf("trial %d: total variation %.4f, accepted %.1f %% %s\n", trial, tv, 100.0 * acc / N, tv < 0.005 ? "ok" : "FAIL");
+    std::printf("trial %d: total variation %.4f, accepted %.1f %% %s\n", trial, tv, 100.0 * acc / N,
+                tv < 0.005 ? "ok" : "FAIL");
     ok &= tv < 0.005;
   }
   return ok ? 0 : 1;
