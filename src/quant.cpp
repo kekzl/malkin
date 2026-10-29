@@ -212,51 +212,102 @@ PackedBuffer pack_weight(Weight& w, bool wide) {
   return b;
 }
 
-void matmul(const Weight& w, const float* x, const BlockQ8* xq, int n, float* y) {
-  const bool wide = w.wide && n > kWideMinTokens;
-  if (wide || w.packed) {
-    // Work items: (panel pair, token tile); static order keeps a pair's tiles on one thread.
-    // Decode (n == 1) uses single panels: twice the items for the threads, no compute to share.
-    const uint8_t* base = wide ? w.wide : w.packed;
-    const size_t pb = wide ? w.wide_bytes : w.panel_bytes;
-    const int nt_max = kern::gemm_tile(w.type, wide);
-    const int R = kern::panel_rows();
-    const int np = n > 1 ? 2 : 1;
-    const int64_t panels = (w.rows + R - 1) / R;
-    const int64_t groups = (panels + np - 1) / np;
-    const int64_t nb = w.cols / 32;
-    if (kern::gemm_unsigned_acts(w.type, wide)) {
-      // Same blocks with qs ^ 0x80 (= qs + 128 as unsigned bytes); n * cols bytes, small next to the GEMM.
-      static thread_local std::vector<BlockQ8> ux;
-      if (ux.size() < static_cast<size_t>(n * nb)) ux.resize(n * nb);
-      BlockQ8* u = ux.data();  // thread_local: resolve on this thread, not inside the parallel region
+namespace {
+
+// Panel GEMM of one weight, cut into work items: one panel group (2 panels for n > 1, else 1) x one token chunk.
+struct PanelPlan {
+  const Weight* w;
+  float* y;
+  const BlockQ8* xq;
+  bool wide;
+  const uint8_t* base;
+  size_t pb;
+  int nt_max, np, tiles, chunks, per;
+  int64_t panels, items;
+};
+
+PanelPlan plan_panels(const Weight& w, float* y, const BlockQ8* xq, int n, int64_t threads) {
+  PanelPlan p{};
+  p.w = &w;
+  p.y = y;
+  p.xq = xq;
+  p.wide = w.wide && n > kWideMinTokens;
+  p.base = p.wide ? w.wide : w.packed;
+  p.pb = p.wide ? w.wide_bytes : w.panel_bytes;
+  p.nt_max = kern::gemm_tile(w.type, p.wide);
+  p.np = n > 1 ? 2 : 1;
+  p.panels = (w.rows + kern::panel_rows() - 1) / kern::panel_rows();
+  const int64_t groups = (p.panels + p.np - 1) / p.np;
+  p.tiles = (n + p.nt_max - 1) / p.nt_max;
+  p.chunks = static_cast<int>(std::clamp<int64_t>((threads * 4 + groups - 1) / groups, 1, p.tiles));
+  p.per = (p.tiles + p.chunks - 1) / p.chunks;
+  p.items = groups * p.chunks;
+  return p;
+}
+
+void run_item(const PanelPlan& pl, int64_t item, int n) {
+  const Weight& w = *pl.w;
+  const int R = kern::panel_rows();
+  const int64_t nb = w.cols / 32;
+  const int64_t p = item / pl.chunks * pl.np;
+  const int gp = static_cast<int>(std::min<int64_t>(pl.np, pl.panels - p));
+  const int rv = static_cast<int>(std::min<int64_t>(static_cast<int64_t>(gp) * R, w.rows - p * R));
+  const int tt_end = std::min(pl.tiles, static_cast<int>(item % pl.chunks + 1) * pl.per);
+  for (int tt = static_cast<int>(item % pl.chunks) * pl.per; tt < tt_end; ++tt) {
+    const int t0 = tt * pl.nt_max, nt = std::min(pl.nt_max, n - t0);
+    kern::gemm_panels(w.type, pl.wide, pl.base + p * pl.pb, pl.pb, gp, w.cols, pl.xq + t0 * nb, nt,
+                      pl.y + t0 * w.rows + p * R, w.rows, rv);
+  }
+}
+
+}  // namespace
+
+void matmul_group(std::initializer_list<MatmulOut> outs, const float* x, const BlockQ8* xq, int n) {
+  for (const auto& o : outs) {
+    if (!o.w->packed && !(o.w->wide && n > kWideMinTokens)) {
+      for (const auto& m : outs) matmul(*m.w, x, xq, n, m.y);
+      return;
+    }
+  }
+  const int64_t threads = omp_get_max_threads();
+  const int64_t nb = outs.begin()->w->cols / 32;
+  const BlockQ8* uxq = nullptr;
+  for (const auto& o : outs) {
+    if (!kern::gemm_unsigned_acts(o.w->type, o.w->wide && n > kWideMinTokens) || uxq) continue;
+    // Same blocks with qs ^ 0x80 (= qs + 128 as unsigned bytes); n * cols bytes, small next to the GEMM.
+    static thread_local std::vector<BlockQ8> ux;
+    if (ux.size() < static_cast<size_t>(n * nb)) ux.resize(n * nb);
+    BlockQ8* u = ux.data();  // thread_local: resolve on this thread, not inside the parallel region
 #pragma omp parallel for schedule(static)
-      for (int64_t i = 0; i < n * nb; ++i) {
-        u[i] = xq[i];
-        for (int8_t& v : u[i].qs) v = static_cast<int8_t>(static_cast<uint8_t>(v) ^ 0x80);
-      }
-      xq = u;
+    for (int64_t i = 0; i < n * nb; ++i) {
+      u[i] = xq[i];
+      for (int8_t& v : u[i].qs) v = static_cast<int8_t>(static_cast<uint8_t>(v) ^ 0x80);
     }
-    // Work item: one panel group x one token chunk, all its tiles in a row (the group stays in L2).
-    // Dynamic hand-out: with other tenants on some cores, static splits wait for the slowest thread
-    // (14B Q6_K gate+up: 1.57 TMAC/s in the model vs 3.0 in isolation).
-    const int64_t threads = omp_get_max_threads();
-    const int tiles = (n + nt_max - 1) / nt_max;
-    const int chunks = static_cast<int>(std::clamp<int64_t>((threads * 4 + groups - 1) / groups, 1, tiles));
-    const int per = (tiles + chunks - 1) / chunks;
+    uxq = u;
+  }
+  constexpr int kMax = 4;
+  PanelPlan plans[kMax];
+  int64_t end[kMax];
+  int np = 0;
+  for (const auto& o : outs) {
+    const bool wide = o.w->wide && n > kWideMinTokens;
+    plans[np] = plan_panels(*o.w, o.y, kern::gemm_unsigned_acts(o.w->type, wide) ? uxq : xq, n, threads);
+    end[np] = (np ? end[np - 1] : 0) + plans[np].items;
+    ++np;
+  }
+  // One region for all weights: one fork/join per group (q/k/v, gate/up). Dynamic hand-out: with other tenants on
+  // some cores, static splits wait for the slowest thread (14B Q6_K gate+up: 1.57 TMAC/s in the model vs 3.0 alone).
 #pragma omp parallel for schedule(dynamic, 1)
-    for (int64_t item = 0; item < groups * chunks; ++item) {
-      const int64_t g = item / chunks;
-      const int64_t p = g * np;
-      const int gp = static_cast<int>(std::min<int64_t>(np, panels - p));
-      const int rv = static_cast<int>(std::min<int64_t>(static_cast<int64_t>(gp) * R, w.rows - p * R));
-      const int tt_end = std::min(tiles, static_cast<int>(item % chunks + 1) * per);
-      for (int tt = static_cast<int>(item % chunks) * per; tt < tt_end; ++tt) {
-        const int t0 = tt * nt_max, nt = std::min(nt_max, n - t0);
-        kern::gemm_panels(w.type, wide, base + p * pb, pb, gp, w.cols, xq + t0 * nb, nt, y + t0 * w.rows + p * R,
-                          w.rows, rv);
-      }
-    }
+  for (int64_t item = 0; item < end[np - 1]; ++item) {
+    int j = 0;
+    while (item >= end[j]) ++j;
+    run_item(plans[j], item - (j ? end[j - 1] : 0), n);
+  }
+}
+
+void matmul(const Weight& w, const float* x, const BlockQ8* xq, int n, float* y) {
+  if (w.packed || (w.wide && n > kWideMinTokens)) {
+    matmul_group({{&w, y}}, x, xq, n);
     return;
   }
   // Tiles of up to 16 rows, at least 4 tiles per thread (1024 rows on 84 cores: tile 3).

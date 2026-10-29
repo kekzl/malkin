@@ -11,8 +11,8 @@ clang-format-"$LLVM" --dry-run -Werror "${cxx[@]}"
 
 echo "== clang-tidy"
 cmake -B build-lint -G Ninja -DCMAKE_EXPORT_COMPILE_COMMANDS=ON > /dev/null
-# kernels_neon.cpp only compiles for aarch64.
-mapfile -t tus < <(find src tests -name '*.cpp' ! -name 'kernels_neon.cpp' | sort)
+# kernels_neon.cpp and gemm_neon.cpp only compile for aarch64.
+mapfile -t tus < <(find src tests -name '*.cpp' ! -name 'kernels_neon.cpp' ! -name 'gemm_neon.cpp' | sort)
 clang-tidy-"$LLVM" -p build-lint --quiet "${tus[@]}"
 
 echo "== shellcheck"

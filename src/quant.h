@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <initializer_list>
 #include <vector>
 
 #include "gguf.h"
@@ -57,6 +58,13 @@ void quantize_acts(const float* x, int n, int64_t k, std::vector<BlockQ8>& out);
 
 // y[t][r] = sum_c W[r][c] * x[t][c] for t < n. xq from quantize_acts, unused for float weights.
 void matmul(const Weight& w, const float* x, const BlockQ8* xq, int n, float* y);
+
+// Up to 4 weights with the same input (q/k/v, gate/up) in one parallel region.
+struct MatmulOut {
+  const Weight* w;
+  float* y;
+};
+void matmul_group(std::initializer_list<MatmulOut> outs, const float* x, const BlockQ8* xq, int n);
 
 float fp16_to_fp32(uint16_t h);
 uint16_t fp32_to_fp16(float f);

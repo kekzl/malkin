@@ -307,9 +307,7 @@ void Model::run(const int32_t* tokens, int n, float* logits) {
     for (int t = 0; t < n; ++t) rmsnorm(h_.data() + t * E, x_.data() + t * E, L.attn_norm, E, c.rms_eps);
     quantize_acts(h_.data(), n, E, xq_);
     // Pre-attention RMSNorm, Q8 activations shared by the Q, K, V projections.
-    matmul(L.wq, h_.data(), xq_.data(), n, q_.data());
-    matmul(L.wk, h_.data(), xq_.data(), n, k_.data());
-    matmul(L.wv, h_.data(), xq_.data(), n, v_.data());
+    matmul_group({{&L.wq, q_.data()}, {&L.wk, k_.data()}, {&L.wv, v_.data()}}, h_.data(), xq_.data(), n);
     lap(0);
 
     // Q/K head norms, RoPE, then K and V into the cache rows kv_at_.
@@ -345,8 +343,7 @@ void Model::run(const int32_t* tokens, int n, float* logits) {
     for (int t = 0; t < n; ++t) rmsnorm(h_.data() + t * E, x_.data() + t * E, L.ffn_norm, E, c.rms_eps);
     quantize_acts(h_.data(), n, E, xq_);
     // SwiGLU FFN: down(silu(gate(h)) * up(h)), residual add.
-    matmul(L.w_gate, h_.data(), xq_.data(), n, gate_.data());
-    matmul(L.w_up, h_.data(), xq_.data(), n, up_.data());
+    matmul_group({{&L.w_gate, gate_.data()}, {&L.w_up, up_.data()}}, h_.data(), xq_.data(), n);
     lap(4);
 #pragma omp parallel for schedule(static) if (n > 1)
     for (int t = 0; t < n; ++t)

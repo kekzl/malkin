@@ -1,5 +1,6 @@
 // ISA dot kernels vs scalar dequantize + dot on random blocks.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -121,6 +122,56 @@ static bool check_bf16_helpers() {
   return ok;
 }
 
+// attend_gqa vs double reference: GQA heads, D not a multiple of 64, extra keys (tree verification).
+static bool check_attention() {
+  std::uniform_real_distribution<float> uf(-3.0f, 3.0f);
+  bool ok = true;
+  double worst = 0;
+  for (int G : {1, 2, 4})
+    for (int D : {64, 80, 128})
+      for (int n : {1, 7, 300}) {
+        const int ne = n > 1 ? 3 : 0;
+        const size_t stride = static_cast<size_t>(D) + 16;
+        std::vector<float> q(static_cast<size_t>(G) * D), out(q.size()), scratch(static_cast<size_t>(G) * (n + ne));
+        std::vector<uint16_t> k(stride * (n + 5)), v(k.size());
+        for (auto& x : q) x = uf(rng);
+        for (size_t i = 0; i < k.size(); ++i) k[i] = fp32_to_bf16(uf(rng)), v[i] = fp32_to_bf16(uf(rng));
+        const int extra[3] = {n + 4, n + 1, n + 2};
+        const float scale = 1.0f / std::sqrt(static_cast<float>(D));
+        kern::attend_gqa(q.data(), G, D, k.data(), v.data(), stride, n, scale, out.data(), scratch.data(), extra, ne);
+        for (int h = 0; h < G; ++h) {
+          std::vector<double> s(n + ne);
+          double mx = -1e300, sum = 0;
+          for (int j = 0; j < n + ne; ++j) {
+            const size_t r = static_cast<size_t>(j < n ? j : extra[j - n]) * stride;
+            double d = 0;
+            for (int i = 0; i < D; ++i) d += static_cast<double>(q[h * D + i]) * bf16_to_fp32(k[r + i]);
+            mx = std::max(mx, s[j] = d * scale);
+          }
+          for (double& x : s) sum += x = std::exp(x - mx);
+          for (int i = 0; i < D; ++i) {
+            double o = 0;
+            for (int j = 0; j < n + ne; ++j)
+              o += s[j] / sum * bf16_to_fp32(v[static_cast<size_t>(j < n ? j : extra[j - n]) * stride + i]);
+            const double err = std::fabs(out[h * D + i] - o);
+            worst = std::max(worst, err);
+            ok &= err < 1e-4;
+          }
+        }
+      }
+  std::vector<float> g(37), u(37), g0;
+  for (size_t i = 0; i < g.size(); ++i) g[i] = 30.0f * uf(rng), u[i] = uf(rng);
+  g[0] = -200.0f;
+  g0 = g;
+  kern::silu_mul(static_cast<int64_t>(g.size()), g.data(), u.data());
+  for (size_t i = 0; i < g.size(); ++i) {
+    const double ref = g0[i] / (1.0 + std::exp(-static_cast<double>(g0[i]))) * u[i];
+    ok &= std::fabs(g[i] - ref) <= 1e-5 * (1 + std::fabs(ref));
+  }
+  std::printf("attention + silu worst abs err %.2e %s\n", worst, ok ? "ok" : "FAIL");
+  return ok;
+}
+
 // Panel GEMM vs row path: 19 rows (partial pair), 35 rows (pair + partial single), tokens across tile edges.
 static bool check_gemm(GgmlType t, int64_t k, int rows, bool outliers = false) {
   if (kern::panel_bytes(t, k, false) == 0) return true;
@@ -153,6 +204,11 @@ static bool check_gemm(GgmlType t, int64_t k, int rows, bool outliers = false) {
     std::vector<float> y0(static_cast<size_t>(n) * rows), y1(static_cast<size_t>(n) * rows);
     matmul(w, x.data(), xq.data(), n, y0.data());
     matmul(wp, x.data(), xq.data(), n, y1.data());
+    std::vector<float> y2(y1.size()), y3(y1.size());
+    matmul_group({{&wp, y2.data()}, {&w, y3.data()}}, x.data(), xq.data(), n);  // mixed: falls back to matmul
+    ok &= y3 == y0;
+    matmul_group({{&wp, y2.data()}, {&wp, y3.data()}}, x.data(), xq.data(), n);
+    ok &= y2 == y1 && y3 == y1;
     double rms = 0;
     for (float v : y0) rms += static_cast<double>(v) * v;
     rms = std::sqrt(rms / y0.size());
@@ -172,7 +228,7 @@ int main() {
     std::printf("skip: CPU lacks %s\n", miss.c_str());
     return 77;
   }
-  bool ok = check_q8_sums() && check_bf16_helpers();
+  bool ok = check_q8_sums() && check_bf16_helpers() && check_attention();
   for (auto t :
        {GgmlType::F32, GgmlType::F16, GgmlType::BF16, GgmlType::Q8_0, GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K}) {
     ok &= check(t, 2560);
