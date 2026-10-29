@@ -249,7 +249,7 @@ class Server {
     const std::string id = rand_id("chatcmpl-");
     const int64_t created = now_s();
     const std::string model = e_.model_id();
-    if (!p.stream) {
+    if (!p.stream) {  // one JSON message
       GenResult r = e_.generate(p.req, nullptr);
       log_request("chat", r);
       ReasoningSplitter sp(p.thinking);
@@ -360,6 +360,9 @@ class Server {
         }));
   }
 
+  // Anthropic /v1/messages: maps the request onto the chat path (system prompt, stop_sequences, thinking),
+  // answers with content blocks (thinking, then text) or the SSE event sequence message_start ...
+  // content_block_* ... message_delta, message_stop.
   void messages(const json& b, httplib::Response& res) {
     check_no_tools(b);
     std::vector<ChatMessage> msgs;
@@ -370,6 +373,7 @@ class Server {
       if (role != "user" && role != "assistant") throw BadRequest("role '" + role + "' unsupported");
       msgs.push_back({role, content_text(m.contains("content") ? m["content"] : json())});
     }
+    // Reuse the OpenAI request path: rename stop_sequences, translate thinking to enable_thinking.
     json sb = b;
     sb.erase("stop");
     if (b.contains("stop_sequences")) sb["stop"] = b["stop_sequences"];
@@ -384,7 +388,7 @@ class Server {
                   {"cache_read_input_tokens", r.cached_tokens},
                   {"output_tokens", r.completion_tokens}};
     };
-    if (!p.stream) {
+    if (!p.stream) {  // one JSON message
       GenResult r = e_.generate(p.req, nullptr);
       log_request("messages", r);
       ReasoningSplitter sp(p.thinking);
@@ -408,6 +412,7 @@ class Server {
         // NOLINTNEXTLINE(bugprone-exception-escape): guarded() catches everything this lambda throws.
         "text/event-stream", guarded([this, p, id, model, stop_reason, usage](size_t, httplib::DataSink& sink) {
           auto write = [&](const std::string& s) { return sink.is_writable() && sink.write(s.data(), s.size()); };
+          // Open: message_start; content blocks switch between thinking and text as the splitter emits them.
           write(sse_event("message_start",
                           {{"type", "message_start"},
                            {"message",
