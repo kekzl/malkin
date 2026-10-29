@@ -3,11 +3,17 @@
 #include <cstdio>
 #include <random>
 
+#include "cpu.h"
 #include "sampler.h"
 
 using namespace malkin;
 
 int main() {
+  // malkin_core is built for AVX-512 / dotprod: skip (ctest code 77) on CPUs without them, like test_quant.
+  if (const auto miss = cpu_missing_features(); !miss.empty()) {
+    std::printf("skip: CPU lacks %s\n", miss.c_str());
+    return 77;
+  }
   std::mt19937 rng(7);
   std::uniform_real_distribution<float> u(0.0f, 1.0f);
   bool ok = true;

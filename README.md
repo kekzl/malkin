@@ -9,6 +9,8 @@
 AVX-512 (Zen 4 / Zen 5, EPYC 9004/9005, Sapphire Rapids+) · Arm Neoverse-N1+ · one <code>docker run</code> · OpenAI and Anthropic API</p>
 
 <p align="center">
+  <a href="https://github.com/kekzl/malkin/actions/workflows/ci.yml"><img src="https://github.com/kekzl/malkin/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/kekzl/malkin/actions/workflows/codeql.yml"><img src="https://github.com/kekzl/malkin/actions/workflows/codeql.yml/badge.svg" alt="CodeQL"></a>
   <img src="https://img.shields.io/badge/C++-26-00599C?style=flat&logo=cplusplus" alt="C++26">
   <img src="https://img.shields.io/badge/LLVM-23-262D3A?style=flat&logo=llvm" alt="LLVM 23">
   <img src="https://img.shields.io/badge/ISA-AVX--512%20VNNI%20%7C%20NEON%20dotprod-9b5cff?style=flat" alt="ISA">
@@ -27,16 +29,27 @@ AVX-512 (Zen 4 / Zen 5, EPYC 9004/9005, Sapphire Rapids+) · Arm Neoverse-N1+ ·
 
 <!-- [PROV: date=2026-10-29 hw=Ryzen7-9800X3D WSL2 commit=aa79ffb cmd=`tools/bench_vs_llama.sh MODEL 512 32 2` (malkin bench -pp 512 -tg 32 vs llama-bench -p 512 -n 32 -t 8, ghcr.io/ggml-org/llama.cpp:full build 8642541b2), best of 2, back to back, host load 5-8 from other tenants] -->
 
-Prompt = 512-token prefill, answer = 32-token generation, same GGUF file in both engines. Answer speed without a draft model is memory-bound and level with llama.cpp; with a draft model (below) malkin generates the same tokens faster.
+Prompt = 512-token prefill, answer = 32-token generation, same GGUF file in both engines. Answer speed without a draft model is memory-bound (both engines read every weight once per token) and level with llama.cpp; with a draft model (below) malkin generates the same tokens 1.85x to 2.38x faster.
 
 **Same quality.** Perplexity on the same text and windows (`malkin ppl` vs `llama-perplexity -c 512`, 2040 tokens): 4B Q8_0 18.0197 vs 18.0256, 4B Q4_K_M 18.2418 vs 18.1540 (llama.cpp's error bar: ±1.41).
 
-**Speculative decoding, lossless.** `--draft qwen3-0.6b-q8_0.gguf`: the draft proposes tokens, the target checks all of them in one pass. Greedy output is byte-identical to plain decoding; sampled output follows the target's distribution exactly (rejection step, `tests/test_sampler.cpp`). Qwen3-8B Q8_0, 200 tokens: 7.3 -> **12.0 tokens/s** (44 % of drafts accepted).
+**Answers with a draft model, lossless.** `--draft qwen3-0.6b-q4_k_m.gguf`: the draft proposes a chain of tokens plus its second choice at every step, the target checks the whole tree in one pass (same weight read as one token). Greedy output is byte-identical to plain decoding; sampled output follows the target's distribution exactly (rejection step, `tests/test_sampler.cpp`).
+
+| Qwen3 target, Qwen3-0.6B Q4_K_M draft, tokens/s | llama.cpp | malkin | malkin + draft | |
+| --- | ---: | ---: | ---: | ---: |
+| 8B Q8_0 | 6.70 | 7.27 | **15.95** | **2.38x** |
+| 4B-Instruct-2507 Q8_0 | 12.30 | 12.60 | **22.74** | **1.85x** |
+| 14B Q6_K | 4.61 | 4.39 | **9.59** | **2.08x** |
+
+<!-- [PROV: date=2026-10-29 hw=Ryzen7-9800X3D WSL2 commit=c4776b8 cmd=`tools/bench_decode.sh TARGET qwen3-0.6b-q4_k_m.gguf 200`: malkin run, 4 prompts (explanation, Python code, list, summary), 200 greedy tokens each, total tokens / total time; llama.cpp = llama-bench -p 0 -n 128 -t 8 -r 2 on the same GGUF; host load 5-10 from other tenants] -->
+
+Four prompt types (explanation, code, list, summary), 200 greedy tokens each. llama.cpp column: `llama-bench` generation on its defaults (no draft). The 0.6B draft fits the original Qwen3 release (8B) better than the newer 4B-Instruct-2507 post-training (one-prompt runs: 55 % vs 47 % of drafts accepted). Draft from the Hugging Face weights: `llama.cpp:full --convert --outtype q8_0 Qwen3-0.6B`, then `--quantize ... Q4_K_M`.
 
 ### Where malkin loses, and what it is not
 
 - **Two ISAs.** No AVX2-only x86, no Apple, no SVE paths yet (Neoverse-V1/V2 run the N1 kernels).
 - **Q6_K prompt reading** is 1.18x llama.cpp, not 2x; llama.cpp's Q6_K kernels are its most efficient.
+- **Answers without a draft model** are level with llama.cpp: memory bandwidth, not compute, sets the pace. llama.cpp can run a draft model too; the tables compare both engines on their defaults.
 - **One architecture:** Qwen3 dense (`qwen3`). No MoE, no vision, no tool calls yet.
 - **One sequence at a time**, with prefix reuse; no batching of concurrent requests.
 - **Neoverse numbers are emulated** (`qemu -cpu neoverse-n1`): correct, not benchmarked on hardware.
@@ -81,6 +94,7 @@ Hybrid reasoning models: `<think>` output goes to `reasoning_content` (OpenAI) o
 | Panels | 16 weight rows interleaved per 64-byte vector, one `vpdpbusd` lane per row; compact panels (about GGUF size) for generation, wide panels (one byte per weight) for K-quant prompt reading |
 | GEMM | 2 panels x up to 6 tokens per call, activations as Q8 blocks of 32 with per-half sums for the K-quant minimum terms; work handed out dynamically per (panel pair, token chunk) |
 | Attention | the query heads of one KV head (GQA) share every K/V row load; vectorized exp |
+| Speculation | greedy: draft top-1 chain + top-2 sibling per depth, verified as a tree (each node attends to the prefix and its ancestors, RoPE at its depth), accepted path compacted in the KV cache; sampling: chain with the exact rejection step |
 | Threads | one engine thread, one OpenMP pool; physical cores for both phases (prefill 348.1 vs 188.7 tok/s on 16 SMT threads, 9800X3D) |
 | NUMA | weights first-touched in parallel at load, so pages spread across EPYC NPS2/NPS4 nodes |
 
