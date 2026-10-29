@@ -23,15 +23,15 @@ AVX-512 (Zen 4 / Zen 5, EPYC 9004/9005, Sapphire Rapids+) · Arm Neoverse-N1+ ·
 
 | Qwen3, tokens/s, 8 threads | malkin prompt | llama.cpp prompt | | malkin answer | llama.cpp answer |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| 4B Q8_0 | **502.8** | 121.86 | **4.13x** | 12.55 | 13.46 |
-| 4B Q4_K_M | **514.8** | 251.24 | **2.05x** | 21.85 | 21.95 |
-| 14B Q6_K | **143.3** | 121.37 | 1.18x | **5.20** | 4.72 |
+| 4B Q8_0 | **506.7** | 116.83 | **4.34x** | 12.55 | 13.46 |
+| 4B Q4_K_M | **513.5** | 241.07 | **2.13x** | 21.85 | 21.95 |
+| 14B Q6_K | **167.4** | 116.31 | 1.44x | **5.20** | 4.72 |
 
-<!-- [PROV: date=2026-10-29 hw=Ryzen7-9800X3D WSL2 commit=aa79ffb cmd=`tools/bench_vs_llama.sh MODEL 512 32 2` (malkin bench -pp 512 -tg 32 vs llama-bench -p 512 -n 32 -t 8, ghcr.io/ggml-org/llama.cpp:full build 8642541b2), best of 2, back to back, host load 5-8 from other tenants] -->
+<!-- [PROV: prompt columns: date=2026-10-29 hw=Ryzen7-9800X3D WSL2 branch=q6k-wide-epilogue cmd=malkin bench --ctx 4096 -pp 512 -tg 1 vs llama-bench -p 512 -n 0 -t 8 -r 1 (ghcr.io/ggml-org/llama.cpp:full build 8642541b2), interleaved with the main build, best of 3, host load 7-9 from other tenants. Answer columns: date=2026-10-29 commit=aa79ffb cmd=`tools/bench_vs_llama.sh MODEL 512 32 2`, best of 2, host load 5-8] -->
 
 Prompt = 512-token prefill, answer = 32-token generation, same GGUF file in both engines. Answer speed without a draft model is memory-bound (both engines read every weight once per token) and level with llama.cpp; with a draft model (below) malkin generates the same tokens 1.85x to 2.38x faster.
 
-**Same quality.** Perplexity on the same text and windows (`malkin ppl` vs `llama-perplexity -c 512`, 2040 tokens): 4B Q8_0 18.0197 vs 18.0256, 4B Q4_K_M 18.2418 vs 18.1540 (llama.cpp's error bar: ±1.41).
+**Same quality.** Perplexity on the same text and windows (`malkin ppl` vs `llama-perplexity -c 512`, 2040 tokens): 4B Q8_0 18.0245 vs 18.0256, 4B Q4_K_M 18.2496 vs 18.1540, 14B Q6_K 14.0375 vs 14.0468 (llama.cpp's error bar: ±1.41 and ±1.02).
 
 **Answers with a draft model, lossless.** `--draft qwen3-0.6b-q4_k_m.gguf`: the draft proposes a chain of tokens plus its second choice at every step, the target checks the whole tree in one pass (same weight read as one token). Greedy output is byte-identical to plain decoding; sampled output follows the target's distribution exactly (rejection step, `tests/test_sampler.cpp`).
 
@@ -50,7 +50,7 @@ Four prompt types (explanation, code, list, summary), 200 greedy tokens each. ll
 ### Where malkin loses, and what it is not
 
 - **Two ISAs.** No AVX2-only x86, no Apple, no SVE paths yet (Neoverse-V1/V2 run the N1 kernels).
-- **Q6_K prompt reading** is 1.18x llama.cpp, not 2x; llama.cpp's Q6_K kernels are its most efficient.
+- **Q6_K prompt reading** is 1.44x llama.cpp, not 2x: its scale per 16 weights needs a float multiply per 4 `vpdpbusd` on the same ports (one core: 0.43 TMAC/s, 0.51 in an ablation build without scales).
 - **Answers without a draft model** are level with llama.cpp: memory bandwidth, not compute, sets the pace. llama.cpp can run a draft model too; the tables compare both engines on their defaults.
 - **One architecture:** Qwen3 dense (`qwen3`). No MoE, no vision, no tool calls yet.
 - **One sequence at a time**, with prefix reuse; no batching of concurrent requests.
@@ -126,7 +126,7 @@ malkin ppl     --model PATH -f FILE [--window 512]
 
 | Environment | Effect |
 |---|---|
-| `MALKIN_NO_WIDE=1` | no wide prompt panels (saves about 1 byte per K-quant weight of RAM) |
+| `MALKIN_NO_WIDE=1` | no wide prompt panels (saves 1.09 bytes per Q4_K/Q5_K weight, 1.20 per Q6_K weight of RAM) |
 | `MALKIN_NO_PACK=1` | row-by-row kernels only (A/B reference) |
 | `MALKIN_PROFILE=1` | wall time per forward stage at exit |
 
@@ -143,7 +143,7 @@ tools/bench_vs_llama.sh /path/model.gguf 512 128 2    # malkin vs llama.cpp, bac
 
 ## Roadmap
 
-1. Q6_K prompt kernels toward 2x; Neoverse panel GEMM (NEON `sdot` by lane).
+1. Neoverse panel GEMM (NEON `sdot` by lane); Q6_K with 256-value activation blocks (one token-scale multiply per superblock).
 2. Long context: adaptive-precision attention after [APA](https://github.com/kekzl/apa) (INT8 cold KV tiles, exact hot tiles).
 3. Architectures: `qwen3moe`, Gemma, gpt-oss (MXFP4); tool calling, Jinja chat templates.
 4. Concurrent requests (continuous batching).

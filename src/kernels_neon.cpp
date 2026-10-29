@@ -187,11 +187,16 @@ int panel_rows() { return 4; }
 size_t panel_bytes(GgmlType, int64_t, bool) { return 0; }
 void pack_panel(GgmlType, bool, const uint8_t*, size_t, int, int64_t, uint8_t*) {}
 int gemm_tile(GgmlType, bool) { return 1; }
+bool gemm_unsigned_acts(GgmlType, bool) { return false; }
 void gemm_panels(GgmlType, bool, const uint8_t*, size_t, int, int64_t, const BlockQ8*, int, float*, int64_t, int) {}
 
 }  // namespace malkin::kern
 
 namespace malkin::kern {
+
+void silu_mul(int64_t n, float* g, const float* u) {
+  for (int64_t i = 0; i < n; ++i) g[i] = g[i] / (1.0f + std::exp(-g[i])) * u[i];
+}
 
 void attend_gqa(const float* q, int G, int D, const uint16_t* k, const uint16_t* v, size_t stride, int n, float scale,
                 float* out, float* scratch, const int* extra, int ne) {
