@@ -69,11 +69,30 @@ Four prompt types (explanation, code, list, summary), 200 greedy tokens each. ll
 
 <!-- [PROV: date=2026-10-29 hw=Ryzen7-9800X3D WSL2 branch=batched-spec cmd=`tools/bench_parallel.sh URL N 128` against `malkin serve --ctx 4096 --parallel 8 [--draft qwen3-0.6b-q4_k_m.gguf]` and `llama-server -t 8 -np 8 -c 32768` (ghcr.io/ggml-org/llama.cpp:full, no draft), interleaved, best of 2, host load 6-8] -->
 
+### Measured on a 4-vCPU EPYC 9634 VPS
+
+Shared cloud slice (netcup, 8 GB RAM, a production host), not bare metal: llama.cpp tg128 on the same file ranged 28.69-44.83 tok/s between rounds.
+
+| Qwen3, 4 threads, best of 3 | pp512 malkin | pp512 llama.cpp | tg128 malkin | tg128 llama.cpp |
+|---|---:|---:|---:|---:|
+| 0.6B Q8_0 | **369.4** | 163.40 | 24.35 | **25.86** |
+| 0.6B Q4_K_M | **328.0** | 184.04 | 26.08 | **39.86** |
+| 1.7B Q4_K_M, `MALKIN_NO_WIDE=1` | **125.7** | 77.83 | 14.45 | **21.36** |
+
+| Decode, 4 threads | EPYC VPS | 9800X3D |
+|---|---:|---:|
+| `bench_layers` Q8_0 / Q4_K / Q6_K, GB/s (1.7B shapes, 16 layers) | 32.49 / 25.45 / 18.26 | 63.78 / 66.93 / 54.02 |
+| attention per token, 0.6B Q4_K_M (`MALKIN_PROFILE=1`) | 2.73 ms | 0.36 ms |
+| 1.7B Q4_K_M plain / + 0.6B draft, tok/s (4 prompts) | 14.55 / 5.88 | 47.5 / 47.7-59.6 |
+
+<!-- [PROV: date=2026-10-29 hw=EPYC 9634 4 vCPU KVM (kekz.org) image=main 2228899 (draft row: PR #19 build, merged as 206b2d7) cmd=`malkin bench --ctx 4096 -pp 512 -tg 128` vs `llama-bench -p 512 -n 128 -t 4 -r 1` (ghcr.io/ggml-org/llama.cpp:full-b11960), interleaved, best of 3, docker --memory 2g (1.7B: 2500m), host load 2-6 from the runs themselves, steal 0 at idle. 9800X3D column: same binaries, OMP_NUM_THREADS=4 / --threads 4, load 0.2-2] -->
+
 ### Where malkin loses, and what it is not
 
 - **Two ISAs.** No AVX2-only x86, no Apple, no SVE paths yet (Neoverse-V1/V2 run the N1 kernels).
 - **Q6_K prompt reading** is 1.44x llama.cpp, not 2x: its scale per 16 weights needs a float multiply per 4 `vpdpbusd` on the same ports (one core: 0.43 TMAC/s, 0.51 in an ablation build without scales).
-- **Answers without a draft model** are level with llama.cpp: memory bandwidth, not compute, sets the pace. llama.cpp can run a draft model too; the tables compare both engines on their defaults.
+- **Answers without a draft model** are level with llama.cpp on the 9800X3D: memory bandwidth, not compute, sets the pace. llama.cpp can run a draft model too; the tables compare both engines on their defaults.
+- **Small VMs.** On the 4-vCPU EPYC VPS answers are 6-35 % slower than llama.cpp: a fixed cost per token (attention 2.73 ms vs 0.36 ms on the 9800X3D) and Q4_K/Q6_K decode kernels below the Q8_0 bandwidth. A 0.6B draft slows a 1.7B target there 2.5x.
 - **RAM.** Packed panels are copies of the weights, so K-quant models take about 3x the GGUF size: Qwen3-1.7B Q4_K_M (1223 MiB file) peaks at 3912 MiB anonymous RSS with ctx 4096, 1788 MiB with `MALKIN_NO_WIDE=1` (slower prompt reading). The auto context fills half of what remains.
 - **One architecture:** Qwen3 dense (`qwen3`). No MoE, no vision, no tool calls yet.
 - **Neoverse numbers are emulated** (`qemu -cpu neoverse-n1`): correct, not benchmarked on hardware.
