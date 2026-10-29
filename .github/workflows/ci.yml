@@ -23,3 +23,16 @@ jobs:
         run: docker buildx build --platform ${{ matrix.platform }} --target test --progress plain .
       - name: runtime image
         run: docker buildx build --platform ${{ matrix.platform }} --target runtime .
+
+  lint:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 -color
+      # clang-format, clang-tidy (bugprone, performance; warnings are errors), shellcheck
+      - name: deps image
+        run: docker buildx build --target deps --load -t malkin-dev:ci .
+      - name: lint
+        run: docker run --rm -v "$PWD:/src" -w /src malkin-dev:ci tools/lint.sh

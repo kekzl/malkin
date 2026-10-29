@@ -19,7 +19,7 @@ apt-get install -y --no-install-recommends ca-certificates curl unzip pkg-config
 curl -fsSL -o /tmp/cmake.tgz "https://github.com/Kitware/CMake/releases/download/v$CMAKE_VERSION/cmake-$CMAKE_VERSION-linux-$cm.tar.gz"
 echo "$cm_sha  /tmp/cmake.tgz" | sha256sum -c -
 tar -xzf /tmp/cmake.tgz -C /opt
-ln -s /opt/cmake-$CMAKE_VERSION-linux-$cm/bin/* /usr/local/bin/
+ln -s "/opt/cmake-$CMAKE_VERSION-linux-$cm"/bin/* /usr/local/bin/
 curl -fsSL -o /tmp/ninja.zip "https://github.com/ninja-build/ninja/releases/download/v$NINJA_VERSION/$nz"
 echo "$nz_sha  /tmp/ninja.zip" | sha256sum -c -
 unzip -q /tmp/ninja.zip -d /usr/local/bin
@@ -41,5 +41,6 @@ echo "deb [arch=$arches signed-by=/etc/apt/keyrings/llvm.asc] http://apt.llvm.or
 apt-get update
 # shellcheck disable=SC2086
 apt-get install -y --no-install-recommends clang-$LLVM lld-$LLVM llvm-$LLVM \
+  clang-format-$LLVM clang-tidy-$LLVM shellcheck \
   libc++-$LLVM-dev$t libc++abi-$LLVM-dev$t libomp-$LLVM-dev$t libpcre2-dev$t $extra
 rm -rf /var/lib/apt/lists/* /tmp/cmake.tgz /tmp/ninja.zip

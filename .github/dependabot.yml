@@ -1,0 +1,22 @@
+version: 2
+updates:
+  # GitHub Actions (SHA-pinned in every workflow)
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
+  # Docker base images (debian:trixie-slim). LLVM, CMake, Ninja are pinned in docker/deps.sh and the
+  # Dockerfile ARGs; cpp-httplib and nlohmann/json by SHA-256 in CMakeLists.txt: bumped by hand.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      docker:
+        patterns:
+          - "*"

@@ -4,8 +4,8 @@
 #include <future>
 #include <memory>
 #include <mutex>
-#include <thread>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "chat.h"
@@ -18,9 +18,9 @@ namespace malkin {
 
 struct EngineOptions {
   std::string model_path;
-  int n_ctx = 0;  // 0: auto
-  int threads = 0;        // decode; 0: physical cores
-  int threads_batch = 0;  // prefill; 0: same as threads
+  int n_ctx = 0;           // 0: auto
+  int threads = 0;         // decode; 0: physical cores
+  int threads_batch = 0;   // prefill; 0: same as threads
   std::string draft_path;  // speculative decoding draft model (same tokenizer); empty: off
   int n_draft = 0;         // max draft tokens per step; 0: default 8 (adaptive below it)
 };

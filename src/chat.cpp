@@ -8,7 +8,7 @@ std::string strip_think(const std::string& s) {
   auto p = s.find("</think>");
   if (p == std::string::npos) return s;
   auto rest = s.substr(p + 8);
-  auto q = rest.find_first_not_of("\n");
+  auto q = rest.find_first_not_of('\n');
   return q == std::string::npos ? std::string() : rest.substr(q);
 }
 

@@ -4,8 +4,8 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cstdio>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -38,7 +38,8 @@ Weight weight(const GgufFile& f, const std::string& name, bool required = true) 
 const float* norm(const GgufFile& f, const std::string& name, int64_t n) {
   const GgufTensor* t = f.tensor(name);
   if (!t) throw std::runtime_error("model: tensor " + name + " missing");
-  if (t->type != GgmlType::F32 || t->nelements() != n) throw std::runtime_error("model: norm " + name + " not F32[" + std::to_string(n) + "]");
+  if (t->type != GgmlType::F32 || t->nelements() != n)
+    throw std::runtime_error("model: norm " + name + " not F32[" + std::to_string(n) + "]");
   return reinterpret_cast<const float*>(t->data);
 }
 
@@ -53,10 +54,12 @@ struct Prof {
   double ms[7] = {};
   ~Prof() {
     if (!on) return;
-    static const char* names[7] = {"norm+qkv", "qk-norm/rope/kv", "attention", "wo+res+norm", "gate+up", "silu+down", "output"};
+    static const char* names[7] = {"norm+qkv", "qk-norm/rope/kv", "attention", "wo+res+norm",
+                                   "gate+up",  "silu+down",       "output"};
     double total = 0;
     for (double v : ms) total += v;
-    for (int i = 0; i < 7; ++i) std::fprintf(stderr, "profile %-16s %9.1f ms %5.1f %%\n", names[i], ms[i], 100 * ms[i] / total);
+    for (int i = 0; i < 7; ++i)
+      std::fprintf(stderr, "profile %-16s %9.1f ms %5.1f %%\n", names[i], ms[i], 100 * ms[i] / total);
   }
 } g_prof;
 
@@ -172,8 +175,8 @@ void Model::attention(int il, int n, int pos) {
       for (int g = 0; g < KV; ++g) {
         const size_t qoff = (static_cast<size_t>(t) * H + static_cast<size_t>(g) * G) * D;
         const bool tree = !anc_off_.empty();
-        kern::attend_gqa(q_.data() + qoff, G, D, kc + static_cast<size_t>(g) * D, vc + static_cast<size_t>(g) * D, kv_row,
-                         tree ? pos : pos + t + 1, scale, att_.data() + qoff, scratch.data(),
+        kern::attend_gqa(q_.data() + qoff, G, D, kc + static_cast<size_t>(g) * D, vc + static_cast<size_t>(g) * D,
+                         kv_row, tree ? pos : pos + t + 1, scale, att_.data() + qoff, scratch.data(),
                          tree ? anc_.data() + anc_off_[t] : nullptr, tree ? anc_off_[t + 1] - anc_off_[t] : 0);
       }
     }

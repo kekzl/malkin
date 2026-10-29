@@ -166,6 +166,20 @@ void log_request(const char* path, const GenResult& r) {
                t["predicted_per_second"].get<double>(), r.finish_reason.c_str());
 }
 
+// Content providers run inside httplib's writer, where an escaping exception would terminate the process;
+// returning false aborts the stream instead.
+template <typename F>
+httplib::ContentProviderWithoutLength guarded(F f) {
+  // NOLINTNEXTLINE(bugprone-exception-escape): only copying the captures can throw, at registration.
+  return [f = std::move(f)](size_t offset, httplib::DataSink& sink) {
+    try {
+      return f(offset, sink);
+    } catch (...) {
+      return false;
+    }
+  };
+}
+
 std::string sse(const json& j) { return "data: " + j.dump() + "\n\n"; }
 
 std::string sse_event(const char* event, const json& j) {
@@ -253,43 +267,50 @@ class Server {
       res.set_content(out.dump(), "application/json");
       return;
     }
-    res.set_chunked_content_provider("text/event-stream", [this, p, id, created, model](size_t, httplib::DataSink& sink) {
-      auto chunk = [&](const json& delta, const json& finish) {
-        return json{{"id", id},
-                    {"object", "chat.completion.chunk"},
-                    {"created", created},
-                    {"model", model},
-                    {"choices", json::array({{{"index", 0}, {"delta", delta}, {"finish_reason", finish}}})}};
-      };
-      auto write = [&](const std::string& s) { return sink.is_writable() && sink.write(s.data(), s.size()); };
-      write(sse(chunk({{"role", "assistant"}, {"content", ""}}, nullptr)));
-      ReasoningSplitter sp(p.thinking);
-      auto emit = [&](const std::pair<std::string, std::string>& d) {
-        bool ok = true;
-        if (!d.first.empty()) ok &= write(sse(chunk({{"reasoning_content", d.first}}, nullptr)));
-        if (!d.second.empty()) ok &= write(sse(chunk({{"content", d.second}}, nullptr)));
-        return ok;
-      };
-      GenResult r;
-      try {
-        r = e_.generate(p.req, [&](const std::string& delta) { return emit(sp.feed(delta)); });
-      } catch (const std::exception& ex) {
-        write(sse({{"error", {{"message", ex.what()}}}}));
-        sink.done();
-        return true;
-      }
-      log_request("chat", r);
-      emit(sp.feed("", true));
-      write(sse(chunk(json::object(), r.finish_reason)));
-      if (p.include_usage) {
-        json u = {{"id", id}, {"object", "chat.completion.chunk"}, {"created", created}, {"model", model},
-                  {"choices", json::array()}, {"usage", usage_json(r)}, {"timings", timings_json(r)}};
-        write(sse(u));
-      }
-      write("data: [DONE]\n\n");
-      sink.done();
-      return true;
-    });
+    res.set_chunked_content_provider(
+        // NOLINTNEXTLINE(bugprone-exception-escape): guarded() catches everything this lambda throws.
+        "text/event-stream", guarded([this, p, id, created, model](size_t, httplib::DataSink& sink) {
+          auto chunk = [&](const json& delta, const json& finish) {
+            return json{{"id", id},
+                        {"object", "chat.completion.chunk"},
+                        {"created", created},
+                        {"model", model},
+                        {"choices", json::array({{{"index", 0}, {"delta", delta}, {"finish_reason", finish}}})}};
+          };
+          auto write = [&](const std::string& s) { return sink.is_writable() && sink.write(s.data(), s.size()); };
+          write(sse(chunk({{"role", "assistant"}, {"content", ""}}, nullptr)));
+          ReasoningSplitter sp(p.thinking);
+          auto emit = [&](const std::pair<std::string, std::string>& d) {
+            bool ok = true;
+            if (!d.first.empty()) ok &= write(sse(chunk({{"reasoning_content", d.first}}, nullptr)));
+            if (!d.second.empty()) ok &= write(sse(chunk({{"content", d.second}}, nullptr)));
+            return ok;
+          };
+          GenResult r;
+          try {
+            r = e_.generate(p.req, [&](const std::string& delta) { return emit(sp.feed(delta)); });
+          } catch (const std::exception& ex) {
+            write(sse({{"error", {{"message", ex.what()}}}}));
+            sink.done();
+            return true;
+          }
+          log_request("chat", r);
+          emit(sp.feed("", true));
+          write(sse(chunk(json::object(), r.finish_reason)));
+          if (p.include_usage) {
+            json u = {{"id", id},
+                      {"object", "chat.completion.chunk"},
+                      {"created", created},
+                      {"model", model},
+                      {"choices", json::array()},
+                      {"usage", usage_json(r)},
+                      {"timings", timings_json(r)}};
+            write(sse(u));
+          }
+          write("data: [DONE]\n\n");
+          sink.done();
+          return true;
+        }));
   }
 
   void completion(const json& b, httplib::Response& res) {
@@ -322,19 +343,21 @@ class Server {
       res.set_content(out.dump(), "application/json");
       return;
     }
-    res.set_chunked_content_provider("text/event-stream", [this, req, body](size_t, httplib::DataSink& sink) {
-      auto write = [&](const std::string& s) { return sink.is_writable() && sink.write(s.data(), s.size()); };
-      try {
-        GenResult r = e_.generate(req, [&](const std::string& d) { return write(sse(body(d, nullptr))); });
-        log_request("completion", r);
-        write(sse(body("", r.finish_reason)));
-      } catch (const std::exception& ex) {
-        write(sse({{"error", {{"message", ex.what()}}}}));
-      }
-      write("data: [DONE]\n\n");
-      sink.done();
-      return true;
-    });
+    res.set_chunked_content_provider(
+        // NOLINTNEXTLINE(bugprone-exception-escape): guarded() catches everything this lambda throws.
+        "text/event-stream", guarded([this, req, body](size_t, httplib::DataSink& sink) {
+          auto write = [&](const std::string& s) { return sink.is_writable() && sink.write(s.data(), s.size()); };
+          try {
+            GenResult r = e_.generate(req, [&](const std::string& d) { return write(sse(body(d, nullptr))); });
+            log_request("completion", r);
+            write(sse(body("", r.finish_reason)));
+          } catch (const std::exception& ex) {
+            write(sse({{"error", {{"message", ex.what()}}}}));
+          }
+          write("data: [DONE]\n\n");
+          sink.done();
+          return true;
+        }));
   }
 
   void messages(const json& b, httplib::Response& res) {
@@ -370,62 +393,80 @@ class Server {
       json blocks = json::array();
       if (!reasoning.empty()) blocks.push_back({{"type", "thinking"}, {"thinking", reasoning}, {"signature", ""}});
       blocks.push_back({{"type", "text"}, {"text", content}});
-      json out = {{"id", id}, {"type", "message"}, {"role", "assistant"}, {"model", model},
-                  {"content", blocks}, {"stop_reason", stop_reason(r)}, {"stop_sequence", nullptr},
+      json out = {{"id", id},
+                  {"type", "message"},
+                  {"role", "assistant"},
+                  {"model", model},
+                  {"content", blocks},
+                  {"stop_reason", stop_reason(r)},
+                  {"stop_sequence", nullptr},
                   {"usage", usage(r)}};
       res.set_content(out.dump(), "application/json");
       return;
     }
-    res.set_chunked_content_provider("text/event-stream", [this, p, id, model, stop_reason, usage](size_t, httplib::DataSink& sink) {
-      auto write = [&](const std::string& s) { return sink.is_writable() && sink.write(s.data(), s.size()); };
-      write(sse_event("message_start",
-                      {{"type", "message_start"},
-                       {"message", {{"id", id}, {"type", "message"}, {"role", "assistant"}, {"model", model},
-                                    {"content", json::array()}, {"stop_reason", nullptr}, {"stop_sequence", nullptr},
-                                    {"usage", {{"input_tokens", p.req.prompt.size()}, {"output_tokens", 0}}}}}}));
-      int index = -1;
-      std::string open;  // "thinking" or "text"
-      auto block = [&](const std::string& kind) {
-        if (open == kind) return;
-        if (!open.empty()) write(sse_event("content_block_stop", {{"type", "content_block_stop"}, {"index", index}}));
-        open = kind;
-        ++index;
-        json cb = kind == "thinking" ? json{{"type", "thinking"}, {"thinking", ""}} : json{{"type", "text"}, {"text", ""}};
-        write(sse_event("content_block_start", {{"type", "content_block_start"}, {"index", index}, {"content_block", cb}}));
-      };
-      ReasoningSplitter sp(p.thinking);
-      auto emit = [&](const std::pair<std::string, std::string>& d) {
-        if (!d.first.empty()) {
-          block("thinking");
-          write(sse_event("content_block_delta", {{"type", "content_block_delta"}, {"index", index},
-                                                  {"delta", {{"type", "thinking_delta"}, {"thinking", d.first}}}}));
-        }
-        if (!d.second.empty()) {
+    res.set_chunked_content_provider(
+        // NOLINTNEXTLINE(bugprone-exception-escape): guarded() catches everything this lambda throws.
+        "text/event-stream", guarded([this, p, id, model, stop_reason, usage](size_t, httplib::DataSink& sink) {
+          auto write = [&](const std::string& s) { return sink.is_writable() && sink.write(s.data(), s.size()); };
+          write(sse_event("message_start",
+                          {{"type", "message_start"},
+                           {"message",
+                            {{"id", id},
+                             {"type", "message"},
+                             {"role", "assistant"},
+                             {"model", model},
+                             {"content", json::array()},
+                             {"stop_reason", nullptr},
+                             {"stop_sequence", nullptr},
+                             {"usage", {{"input_tokens", p.req.prompt.size()}, {"output_tokens", 0}}}}}}));
+          int index = -1;
+          std::string open;  // "thinking" or "text"
+          auto block = [&](const std::string& kind) {
+            if (open == kind) return;
+            if (!open.empty())
+              write(sse_event("content_block_stop", {{"type", "content_block_stop"}, {"index", index}}));
+            open = kind;
+            ++index;
+            json cb = kind == "thinking" ? json{{"type", "thinking"}, {"thinking", ""}}
+                                         : json{{"type", "text"}, {"text", ""}};
+            write(sse_event("content_block_start",
+                            {{"type", "content_block_start"}, {"index", index}, {"content_block", cb}}));
+          };
+          ReasoningSplitter sp(p.thinking);
+          auto emit = [&](const std::pair<std::string, std::string>& d) {
+            if (!d.first.empty()) {
+              block("thinking");
+              write(sse_event("content_block_delta", {{"type", "content_block_delta"},
+                                                      {"index", index},
+                                                      {"delta", {{"type", "thinking_delta"}, {"thinking", d.first}}}}));
+            }
+            if (!d.second.empty()) {
+              block("text");
+              write(sse_event("content_block_delta", {{"type", "content_block_delta"},
+                                                      {"index", index},
+                                                      {"delta", {{"type", "text_delta"}, {"text", d.second}}}}));
+            }
+            return sink.is_writable();
+          };
+          GenResult r;
+          try {
+            r = e_.generate(p.req, [&](const std::string& delta) { return emit(sp.feed(delta)); });
+          } catch (const std::exception& ex) {
+            write(sse_event("error", {{"type", "error"}, {"error", {{"type", "api_error"}, {"message", ex.what()}}}}));
+            sink.done();
+            return true;
+          }
+          log_request("messages", r);
+          emit(sp.feed("", true));
           block("text");
-          write(sse_event("content_block_delta", {{"type", "content_block_delta"}, {"index", index},
-                                                  {"delta", {{"type", "text_delta"}, {"text", d.second}}}}));
-        }
-        return sink.is_writable();
-      };
-      GenResult r;
-      try {
-        r = e_.generate(p.req, [&](const std::string& delta) { return emit(sp.feed(delta)); });
-      } catch (const std::exception& ex) {
-        write(sse_event("error", {{"type", "error"}, {"error", {{"type", "api_error"}, {"message", ex.what()}}}}));
-        sink.done();
-        return true;
-      }
-      log_request("messages", r);
-      emit(sp.feed("", true));
-      block("text");
-      write(sse_event("content_block_stop", {{"type", "content_block_stop"}, {"index", index}}));
-      write(sse_event("message_delta", {{"type", "message_delta"},
-                                        {"delta", {{"stop_reason", stop_reason(r)}, {"stop_sequence", nullptr}}},
-                                        {"usage", usage(r)}}));
-      write(sse_event("message_stop", {{"type", "message_stop"}}));
-      sink.done();
-      return true;
-    });
+          write(sse_event("content_block_stop", {{"type", "content_block_stop"}, {"index", index}}));
+          write(sse_event("message_delta", {{"type", "message_delta"},
+                                            {"delta", {{"stop_reason", stop_reason(r)}, {"stop_sequence", nullptr}}},
+                                            {"usage", usage(r)}}));
+          write(sse_event("message_stop", {{"type", "message_stop"}}));
+          sink.done();
+          return true;
+        }));
   }
 
   Engine& e_;

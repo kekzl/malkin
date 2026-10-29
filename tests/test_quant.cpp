@@ -159,8 +159,8 @@ static bool check_gemm(GgmlType t, int64_t k, int rows) {
       ok &= err < 1e-5;
     }
   }
-  std::printf("gemm %-5s k=%-5lld rows=%-3d worst rel err %.2e %s\n", ggml_type_name(t), static_cast<long long>(k), rows, worst,
-              ok ? "ok" : "FAIL");
+  std::printf("gemm %-5s k=%-5lld rows=%-3d worst rel err %.2e %s\n", ggml_type_name(t), static_cast<long long>(k),
+              rows, worst, ok ? "ok" : "FAIL");
   return ok;
 }
 
@@ -170,12 +170,13 @@ int main() {
     return 77;
   }
   bool ok = check_q8_sums() && check_bf16_helpers();
-  for (auto t : {GgmlType::F32, GgmlType::F16, GgmlType::BF16, GgmlType::Q8_0, GgmlType::Q4_K, GgmlType::Q5_K,
-                 GgmlType::Q6_K}) {
+  for (auto t :
+       {GgmlType::F32, GgmlType::F16, GgmlType::BF16, GgmlType::Q8_0, GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K}) {
     ok &= check(t, 2560);
   }
   ok &= check(GgmlType::Q8_0, 96);  // odd block count: 256-bit tail
   ok &= check(GgmlType::F32, 100);  // scalar tail
-  for (auto t : {GgmlType::Q8_0, GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K}) ok &= check_gemm(t, 512, 19) && check_gemm(t, 512, 35);
+  for (auto t : {GgmlType::Q8_0, GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K})
+    ok &= check_gemm(t, 512, 19) && check_gemm(t, 512, 35);
   return ok ? 0 : 1;
 }

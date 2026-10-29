@@ -1,0 +1,13 @@
+# bugprone-signed-bitwise: byte and nibble arithmetic on uint8_t promoted to int (kernels, packing,
+# tokenizer), all values non-negative.
+Checks: >
+  bugprone-*,
+  performance-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -bugprone-signed-bitwise,
+  -performance-enum-size
+WarningsAsErrors: '*'
+# Own headers only: src/*.h, not build-lint/_deps (httplib, nlohmann/json).
+HeaderFilterRegex: '(^|/)src/[^/]+\.h$'

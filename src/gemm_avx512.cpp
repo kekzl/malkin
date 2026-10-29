@@ -19,8 +19,8 @@ constexpr int R = 16;
 constexpr size_t kQ8_0Pair = 64 + 2 * 8 * 64;
 inline const uint8_t* q8_scales(const uint8_t* p, int64_t b) { return p + (b / 2) * kQ8_0Pair + 32 * (b & 1); }
 inline const uint8_t* q8_weights(const uint8_t* p, int64_t b) { return p + (b / 2) * kQ8_0Pair + 64 + 512 * (b & 1); }
-constexpr size_t kQ4KBlock = 64 + 256 + 64 * 32;          // d/dmin, per-sub-block sc/m, 64 nibble groups
-constexpr size_t kQ5KBlock = kQ4KBlock + 64 * 8;          // + bit-4 mask per group
+constexpr size_t kQ4KBlock = 64 + 256 + 64 * 32;            // d/dmin, per-sub-block sc/m, 64 nibble groups
+constexpr size_t kQ5KBlock = kQ4KBlock + 64 * 8;            // + bit-4 mask per group
 constexpr size_t kQ6KBlock = 32 + 256 + 64 * 32 + 64 * 16;  // d, int8 scale per 16, nibbles, bit-4/5 masks
 
 inline int32_t ld32(const void* p) {
@@ -93,7 +93,8 @@ void k_q8_0(const uint8_t* p, size_t pb, int64_t cols, const BlockQ8* x, float* 
       const __m512i corr = _mm512_set1_epi32(128 * (xb.s[0] + xb.s[1]));
       const __m512 dx = _mm512_set1_ps(xb.d);
       for (int q = 0; q < NP; ++q)
-        acc[q][t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(ai[q][t], corr)), _mm512_mul_ps(dw[q], dx), acc[q][t]);
+        acc[q][t] =
+            _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(ai[q][t], corr)), _mm512_mul_ps(dw[q], dx), acc[q][t]);
     }
   }
   for (int q = 0; q < NP; ++q)
@@ -115,10 +116,12 @@ void k_q45_k(const uint8_t* p, size_t pb, int64_t cols, const BlockQ8* x, float*
       __m512 sc[NP], mn[NP];
       for (int q = 0; q < NP; ++q) {
         const uint8_t* sm = pq[q] + 64 + 32 * j;
-        sc[q] = _mm512_mul_ps(_mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(pq[q]))),
-                              _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(sm)))));
-        mn[q] = _mm512_mul_ps(_mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(pq[q] + 32))),
-                              _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(sm + 16)))));
+        sc[q] = _mm512_mul_ps(
+            _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(pq[q]))),
+            _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(sm)))));
+        mn[q] = _mm512_mul_ps(
+            _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(pq[q] + 32))),
+            _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(sm + 16)))));
       }
       const int64_t xb = sb * 8 + j;
       __m512i ai[NP][NT];
@@ -128,7 +131,8 @@ void k_q45_k(const uint8_t* p, size_t pb, int64_t cols, const BlockQ8* x, float*
         __m512i w[NP];
         for (int q = 0; q < NP; ++q) {
           w[q] = expand_nibbles(pq[q] + 320 + (j * 8 + g) * 32);
-          if constexpr (kHigh) w[q] = _mm512_mask_add_epi8(w[q], _cvtu64_mask64(ld64(pq[q] + kQ4KBlock + (j * 8 + g) * 8)), w[q], c16);
+          if constexpr (kHigh)
+            w[q] = _mm512_mask_add_epi8(w[q], _cvtu64_mask64(ld64(pq[q] + kQ4KBlock + (j * 8 + g) * 8)), w[q], c16);
         }
         for (int t = 0; t < NT; ++t) {
           const __m512i xv = _mm512_set1_epi32(ld32(x[t * nb + xb].qs + 4 * g));
@@ -164,7 +168,8 @@ void k_q6_k(const uint8_t* p, size_t pb, int64_t cols, const BlockQ8* x, float* 
       __m512 dsc[NP];
       for (int q = 0; q < NP; ++q) {
         dsc[q] = _mm512_mul_ps(_mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(pq[q]))),
-                               _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(pq[q] + 32 + 16 * h)))));
+                               _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(
+                                   _mm_loadu_si128(reinterpret_cast<const __m128i*>(pq[q] + 32 + 16 * h)))));
       }
       const int64_t xb = sb * 8 + h / 2;
       const int off = (h & 1) * 16;
@@ -190,7 +195,8 @@ void k_q6_k(const uint8_t* p, size_t pb, int64_t cols, const BlockQ8* x, float* 
         const __m512i bias = _mm512_set1_epi32(32 * xq.s[h & 1]);
         const __m512 dx = _mm512_set1_ps(xq.d);
         for (int q = 0; q < NP; ++q)
-          acc[q][t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(ai[q][t], bias)), _mm512_mul_ps(dsc[q], dx), acc[q][t]);
+          acc[q][t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(ai[q][t], bias)), _mm512_mul_ps(dsc[q], dx),
+                                      acc[q][t]);
       }
     }
   }
@@ -223,8 +229,11 @@ void k_q45_w(const uint8_t* p, size_t pb, int64_t cols, const BlockQ8* x, float*
       __m512 sc[NP], mn[NP];
       for (int q = 0; q < NP; ++q) {
         const uint8_t* sm = pq[q] + 128 + 32 * j;
-        sc[q] = _mm512_mul_ps(d[q], _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(sm)))));
-        mn[q] = _mm512_mul_ps(dmin[q], _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(sm + 16)))));
+        sc[q] = _mm512_mul_ps(
+            d[q], _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(sm)))));
+        mn[q] = _mm512_mul_ps(
+            dmin[q],
+            _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(sm + 16)))));
       }
       const int64_t xb = sb * 8 + j;
       __m512i ai[NP][NT];
@@ -269,7 +278,8 @@ void k_q6_w(const uint8_t* p, size_t pb, int64_t cols, const BlockQ8* x, float* 
     for (int h = 0; h < 16; ++h) {
       __m512 dsc[NP];
       for (int q = 0; q < NP; ++q) {
-        dsc[q] = _mm512_mul_ps(d[q], _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(pq[q] + 64 + 16 * h)))));
+        dsc[q] = _mm512_mul_ps(d[q], _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(
+                                         _mm_loadu_si128(reinterpret_cast<const __m128i*>(pq[q] + 64 + 16 * h)))));
       }
       const int64_t xb = sb * 8 + h / 2;
       const int off = (h & 1) * 16;
@@ -289,7 +299,8 @@ void k_q6_w(const uint8_t* p, size_t pb, int64_t cols, const BlockQ8* x, float* 
         const __m512i bias = _mm512_set1_epi32(32 * xq.s[h & 1]);
         const __m512 dx = _mm512_set1_ps(xq.d);
         for (int q = 0; q < NP; ++q)
-          acc[q][t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(ai[q][t], bias)), _mm512_mul_ps(dsc[q], dx), acc[q][t]);
+          acc[q][t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(ai[q][t], bias)), _mm512_mul_ps(dsc[q], dx),
+                                      acc[q][t]);
       }
     }
   }
@@ -303,11 +314,13 @@ using Kernel = void (*)(const uint8_t*, size_t, int64_t, const BlockQ8*, float*,
 constexpr int kTileQ8_0 = 6, kTileQK = 4, kTileWide = 6;
 
 template <template <int, int> class K, int NP, int... N>
-constexpr auto table(std::integer_sequence<int, N...>) { return std::array<Kernel, sizeof...(N)>{&K<N + 1, NP>::run...}; }
+constexpr auto table(std::integer_sequence<int, N...>) {
+  return std::array<Kernel, sizeof...(N)>{&K<N + 1, NP>::run...};
+}
 
-#define MALKIN_KERNEL(name, fn) \
-  template <int NT, int NP>     \
-  struct name {                 \
+#define MALKIN_KERNEL(name, fn)                                                                                     \
+  template <int NT, int NP>                                                                                         \
+  struct name {                                                                                                     \
     static void run(const uint8_t* p, size_t pb, int64_t c, const BlockQ8* x, float* y, int64_t ys, int rv) { fn; } \
   };
 MALKIN_KERNEL(KQ8_0, (k_q8_0<NT, NP>(p, pb, c, x, y, ys, rv)))
@@ -333,11 +346,20 @@ void dispatch(GgmlType t, bool wide, const uint8_t* p, size_t pb, int64_t cols, 
               int64_t ys, int rv) {
   using T = Tables<NP>;
   switch (t) {
-    case GgmlType::Q8_0: T::q8_0[n - 1](p, pb, cols, x, y, ys, rv); break;
-    case GgmlType::Q4_K: wide ? T::q45w[n - 1](p, pb, cols, x, y, ys, rv) : T::q4k[n - 1](p, pb, cols, x, y, ys, rv); break;
-    case GgmlType::Q5_K: wide ? T::q45w[n - 1](p, pb, cols, x, y, ys, rv) : T::q5k[n - 1](p, pb, cols, x, y, ys, rv); break;
-    case GgmlType::Q6_K: wide ? T::q6w[n - 1](p, pb, cols, x, y, ys, rv) : T::q6k[n - 1](p, pb, cols, x, y, ys, rv); break;
-    default: break;
+    case GgmlType::Q8_0:
+      T::q8_0[n - 1](p, pb, cols, x, y, ys, rv);
+      break;
+    case GgmlType::Q4_K:
+      wide ? T::q45w[n - 1](p, pb, cols, x, y, ys, rv) : T::q4k[n - 1](p, pb, cols, x, y, ys, rv);
+      break;
+    case GgmlType::Q5_K:
+      wide ? T::q45w[n - 1](p, pb, cols, x, y, ys, rv) : T::q5k[n - 1](p, pb, cols, x, y, ys, rv);
+      break;
+    case GgmlType::Q6_K:
+      wide ? T::q6w[n - 1](p, pb, cols, x, y, ys, rv) : T::q6k[n - 1](p, pb, cols, x, y, ys, rv);
+      break;
+    default:
+      break;
   }
 }
 
@@ -472,21 +494,35 @@ int panel_rows() { return R; }
 size_t panel_bytes(GgmlType t, int64_t cols, bool wide) {
   const auto sb = static_cast<size_t>(cols / 256);
   switch (t) {
-    case GgmlType::Q8_0: return wide ? 0 : static_cast<size_t>((cols / 32 + 1) / 2) * kQ8_0Pair;
-    case GgmlType::Q4_K: return sb * (wide ? kQ45WBlock : kQ4KBlock);
-    case GgmlType::Q5_K: return sb * (wide ? kQ45WBlock : kQ5KBlock);
-    case GgmlType::Q6_K: return sb * (wide ? kQ6WBlock : kQ6KBlock);
-    default: return 0;
+    case GgmlType::Q8_0:
+      return wide ? 0 : static_cast<size_t>((cols / 32 + 1) / 2) * kQ8_0Pair;
+    case GgmlType::Q4_K:
+      return sb * (wide ? kQ45WBlock : kQ4KBlock);
+    case GgmlType::Q5_K:
+      return sb * (wide ? kQ45WBlock : kQ5KBlock);
+    case GgmlType::Q6_K:
+      return sb * (wide ? kQ6WBlock : kQ6KBlock);
+    default:
+      return 0;
   }
 }
 
 void pack_panel(GgmlType t, bool wide, const uint8_t* src, size_t ss, int rv, int64_t cols, uint8_t* dst) {
   switch (t) {
-    case GgmlType::Q8_0: pack_q8_0(src, ss, rv, cols, dst); break;
-    case GgmlType::Q4_K: wide ? pack_q45_w(false, src, ss, rv, cols, dst) : pack_q45_k(false, src, ss, rv, cols, dst); break;
-    case GgmlType::Q5_K: wide ? pack_q45_w(true, src, ss, rv, cols, dst) : pack_q45_k(true, src, ss, rv, cols, dst); break;
-    case GgmlType::Q6_K: wide ? pack_q6_w(src, ss, rv, cols, dst) : pack_q6_k(src, ss, rv, cols, dst); break;
-    default: break;
+    case GgmlType::Q8_0:
+      pack_q8_0(src, ss, rv, cols, dst);
+      break;
+    case GgmlType::Q4_K:
+      wide ? pack_q45_w(false, src, ss, rv, cols, dst) : pack_q45_k(false, src, ss, rv, cols, dst);
+      break;
+    case GgmlType::Q5_K:
+      wide ? pack_q45_w(true, src, ss, rv, cols, dst) : pack_q45_k(true, src, ss, rv, cols, dst);
+      break;
+    case GgmlType::Q6_K:
+      wide ? pack_q6_w(src, ss, rv, cols, dst) : pack_q6_k(src, ss, rv, cols, dst);
+      break;
+    default:
+      break;
   }
 }
 

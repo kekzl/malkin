@@ -61,7 +61,8 @@ Engine::Engine(const EngineOptions& o) {
     dfile_ = std::make_unique<GgufFile>(o.draft_path);
     Tokenizer dtok(*dfile_);
     bool same = dtok.size() == tok_->size();
-    for (int32_t id : {0, 1000, 100000, static_cast<int32_t>(tok_->size()) - 1}) same = same && dtok.piece(id) == tok_->piece(id);
+    for (int32_t id : {0, 1000, 100000, static_cast<int32_t>(tok_->size()) - 1})
+      same = same && dtok.piece(id) == tok_->piece(id);
     if (!same) throw std::runtime_error("draft model tokenizer differs from the target");
     draft_ = std::make_unique<Model>(*dfile_, n_ctx);
     dlogits_.resize(static_cast<size_t>(draft_->cfg().n_vocab));
@@ -80,8 +81,8 @@ Engine::Engine(const EngineOptions& o) {
   std::fprintf(stderr,
                "malkin: %s | %s | %d layers, %d embd, %d heads (%d kv), vocab %d | ctx %d (KV %.2f GiB BF16) | "
                "threads %d decode / %d prefill | loaded in %.1f s\n",
-               model_id_.c_str(), cfg.arch.c_str(), cfg.n_layer, cfg.n_embd, cfg.n_head, cfg.n_head_kv,
-               cfg.n_vocab, n_ctx, static_cast<double>(kv_bytes_per_token(cfg)) * n_ctx / (1 << 30), threads_, threads_batch_,
+               model_id_.c_str(), cfg.arch.c_str(), cfg.n_layer, cfg.n_embd, cfg.n_head, cfg.n_head_kv, cfg.n_vocab,
+               n_ctx, static_cast<double>(kv_bytes_per_token(cfg)) * n_ctx / (1 << 30), threads_, threads_batch_,
                ms_since(t0) / 1000.0);
   std::map<std::string, int> types;
   for (const auto& [name, t] : file_->tensors()) ++types[ggml_type_name(t.type)];
@@ -241,8 +242,10 @@ GenResult Engine::generate_locked(const GenRequest& req, const OnText& on_text) 
           int32_t a = 0, b = 1;
           if (dlogits_[b] > dlogits_[a]) std::swap(a, b);
           for (int32_t v = 2; v < dv; ++v) {
-            if (dlogits_[v] > dlogits_[a]) b = a, a = v;
-            else if (dlogits_[v] > dlogits_[b]) b = v;
+            if (dlogits_[v] > dlogits_[a])
+              b = a, a = v;
+            else if (dlogits_[v] > dlogits_[b])
+              b = v;
           }
           chain.push_back(a);
           alt.push_back(b);
@@ -272,8 +275,10 @@ GenResult Engine::generate_locked(const GenRequest& req, const OnText& on_text) 
         sampler.distribution(vlogits_.data() + static_cast<size_t>(cur) * n_vocab, n_vocab, p);
         const int32_t a = p[0].second;
         int slot = -1;
-        if (a == chain[i]) slot = 1 + 2 * i;
-        else if (a == alt[i]) slot = 2 + 2 * i;
+        if (a == chain[i])
+          slot = 1 + 2 * i;
+        else if (a == alt[i])
+          slot = 2 + 2 * i;
         if (slot < 0) {
           next = a;
           bonus_ready = true;
@@ -283,7 +288,8 @@ GenResult Engine::generate_locked(const GenRequest& req, const OnText& on_text) 
         cache_.push_back(a);
         ++r.accepted;
         cur = slot;
-        if (!(go = emit(a))) break;
+        go = emit(a);
+        if (!go) break;
         if (slot == 2 + 2 * i) {  // alternative leaf: nothing below it
           ++i;
           break;
@@ -294,8 +300,10 @@ GenResult Engine::generate_locked(const GenRequest& req, const OnText& on_text) 
         sampler.distribution(vlogits_.data() + static_cast<size_t>(cur) * n_vocab, n_vocab, p);
         next = p[0].second;
       }
-      if (i == kk && kk == k && cur == 2 * kk - 1) k = std::min(k + 1, n_draft_);
-      else if (2 * i < kk) k = std::max(1, k - 1);
+      if (i == kk && kk == k && cur == 2 * kk - 1)
+        k = std::min(k + 1, n_draft_);
+      else if (2 * i < kk)
+        k = std::max(1, k - 1);
       go = emit(next);
     }
   } else {
@@ -344,13 +352,16 @@ GenResult Engine::generate_locked(const GenRequest& req, const OnText& on_text) 
         }
         ++r.accepted;
         cache_.push_back(t);
-        if (!(go = emit(t))) break;
+        go = emit(t);
+        if (!go) break;
       }
       if (!go) break;
       if (i == nb - 1) next = sampler.sample(vlogits_.data() + static_cast<size_t>(nb - 1) * n_vocab, n_vocab);
       // Adapt the draft length: grow after a fully accepted step, shrink when most drafts fail.
-      if (i == nb - 1 && nb - 1 == k) k = std::min(k + 1, n_draft_);
-      else if (2 * i < nb - 1) k = std::max(1, k - 1);
+      if (i == nb - 1 && nb - 1 == k)
+        k = std::min(k + 1, n_draft_);
+      else if (2 * i < nb - 1)
+        k = std::max(1, k - 1);
       go = emit(next);
     }
   }
