@@ -62,3 +62,21 @@ jobs:
       - uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
           category: /language:${{ matrix.language }}
+          upload: never
+          output: sarif-results
+
+      # The traced build also compiles fetched dependencies (build/_deps/httplib, build/deps/nlohmann);
+      # paths: does not filter compiled languages, so their results are dropped here before the upload.
+      - name: Drop results in build/ (third-party headers)
+        run: |
+          set -euo pipefail
+          for f in sarif-results/*.sarif; do
+            jq '.runs[].results |= map(select((.locations[0].physicalLocation.artifactLocation.uri // "") | startswith("build/") | not))' \
+              "$f" > "$f.tmp"
+            mv "$f.tmp" "$f"
+          done
+
+      - uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: sarif-results
+          category: /language:${{ matrix.language }}
