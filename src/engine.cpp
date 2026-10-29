@@ -129,14 +129,17 @@ Engine::Engine(const EngineOptions& o) {
     for (int32_t id : {0, 1000, 100000, static_cast<int32_t>(tok_->size()) - 1})
       same = same && dtok.piece(id) == tok_->piece(id);
     if (!same) throw std::runtime_error("draft model tokenizer differs from the target");
-    draft_ = std::make_unique<Model>(*dfile_, n_ctx);
-    dlogits_.resize(static_cast<size_t>(draft_->cfg().n_vocab));
+    draft_ = std::make_unique<Model>(*dfile_, n_ctx, n_seq);
+    dlogits_.resize(static_cast<size_t>(n_seq) * draft_->cfg().n_vocab);
+    dout_.resize(dlogits_.size());
     if (o.n_draft > 0) n_draft_ = std::min(o.n_draft, Model::kMaxBatch - 1);
-    vlogits_.resize(static_cast<size_t>(2 * n_draft_ + 1) * model_->cfg().n_vocab);  // tree: chain + alternatives
     std::fprintf(stderr, "malkin: draft %s, %d layers, up to %d tokens per step\n",
                  std::filesystem::path(o.draft_path).stem().c_str(), draft_->cfg().n_layer, n_draft_);
   }
-  logits_.resize(static_cast<size_t>(n_seq) * cfg.n_vocab);
+  // Logits rows: every decode token (greedy tree: 2 * n_draft + 1 per slot, at most kMaxBatch) plus one per
+  // prompt that finishes in the step.
+  const int rows = std::min(Model::kMaxBatch, n_seq * (draft_ ? 2 * n_draft_ + 1 : 1)) + n_seq;
+  logits_.resize(static_cast<size_t>(rows) * cfg.n_vocab);
   worker_ = std::thread([this] { worker_loop(); });
   on_worker([this] {
     omp_set_num_threads(threads_batch_);
@@ -246,22 +249,119 @@ void Engine::admit(std::unique_ptr<Request> r) {
   ++busy_;
 }
 
+void Engine::propose() {
+  const int dv = draft_->cfg().n_vocab;
+  // Runs dbatch_ on the draft; copies the logits of flagged tokens to their slot's row of dlogits_.
+  auto flush = [&] {
+    if (dbatch_.empty()) return;
+    draft_->forward(dbatch_.data(), static_cast<int>(dbatch_.size()), dout_.data());
+    size_t row = 0;
+    for (const BatchToken& b : dbatch_) {
+      if (!b.logits) continue;
+      std::copy_n(dout_.data() + row++ * dv, dv, dlogits_.data() + static_cast<size_t>(b.seq) * dv);
+    }
+    dbatch_.clear();
+  };
+  // Catch up: draft KV of each proposing slot to cache + next (common prefix reuse), in passes of kMaxBatch tokens.
+  for (const Proposal& p : props_) {
+    if (p.kk == 0) continue;
+    Slot& s = slots_[p.seq];
+    const size_t len = s.cache.size() + 1;
+    size_t common = 0;
+    while (common < s.dcache.size() && common < s.cache.size() && s.dcache[common] == s.cache[common]) ++common;
+    if (common == s.cache.size() && common < s.dcache.size() && s.dcache[common] == s.req->next) ++common;
+    common = std::min(common, len - 1);  // the last token is evaluated for its logits
+    s.dcache.resize(common);
+    for (size_t pos = common; pos < len; ++pos) {
+      const int32_t id = pos < s.cache.size() ? s.cache[pos] : s.req->next;
+      dbatch_.push_back({id, p.seq, static_cast<int>(pos), pos + 1 == len});
+      s.dcache.push_back(id);
+      if (static_cast<int>(dbatch_.size()) == Model::kMaxBatch) flush();
+    }
+  }
+  flush();
+  // Rounds: every slot picks its next draft token from its logits, then all feed it in one pass.
+  for (int i = 0;; ++i) {
+    bool more = false;
+    for (Proposal& p : props_) {
+      if (i >= p.kk) continue;
+      Slot& s = slots_[p.seq];
+      float* dl = dlogits_.data() + static_cast<size_t>(p.seq) * dv;
+      int32_t a = 0;
+      if (p.greedy) {  // top-1 chain, top-2 alternative
+        int32_t b = 1;
+        if (dl[b] > dl[a]) std::swap(a, b);
+        for (int32_t v = 2; v < dv; ++v) {
+          if (dl[v] > dl[a])
+            b = a, a = v;
+          else if (dl[v] > dl[b])
+            b = v;
+        }
+        p.alt.push_back(b);
+      } else {
+        p.qd.emplace_back();
+        s.req->dsampler->distribution(dl, dv, p.qd.back());
+        a = s.req->dsampler->draw(p.qd.back());
+      }
+      p.chain.push_back(a);
+      if (i + 1 < p.kk) {
+        dbatch_.push_back({a, p.seq, static_cast<int>(s.dcache.size()), true});
+        s.dcache.push_back(a);
+        more = true;
+      }
+    }
+    flush();
+    if (!more) break;
+  }
+}
+
 void Engine::step() {
   const int n_ctx = model_->n_ctx(), n_vocab = model_->cfg().n_vocab;
   const int n_slots = static_cast<int>(slots_.size());
-  if (draft_ && busy_ == 1) {
-    for (int i = 0; i < n_slots; ++i) {
-      if (slots_[i].req && slots_[i].req->decoding) return spec_step(i);
-    }
+  props_.clear();
+  for (int i = 0; i < n_slots; ++i) {
+    if (!slots_[i].req || !slots_[i].req->decoding) continue;
+    props_.emplace_back();
+    props_.back().seq = i;
   }
+  const int nd = static_cast<int>(props_.size());
+  // Draft length per decoding slot: adaptive k, within budget and context; all trees fit one target pass.
+  bool drafting = false;
+  for (Proposal& p : props_) {
+    const Slot& s = slots_[p.seq];
+    const Request& q = *s.req;
+    p.greedy = q.req.sampling.temperature <= 0.0f;
+    if (!draft_) continue;
+    const int left = q.budget - q.r.completion_tokens, free = n_ctx - static_cast<int>(s.cache.size()) - 2;
+    const int cap = Model::kMaxBatch / nd - 1;  // tokens per slot after its next token
+    p.kk = std::max(0, std::min({q.k, left, p.greedy ? free / 2 : free, p.greedy ? cap / 2 : cap}));
+    drafting = drafting || p.kk > 0;
+  }
+  if (drafting) {
+    omp_set_num_threads(threads_);
+    propose();
+  }
+
+  // Target batch. Greedy layout per slot: [next, chain0, alt0, chain1, alt1, ...] at KV rows P, P + 1, ...;
+  // chain i and alt i sit at RoPE position P + 1 + i under chain i - 1. Sampled: [next, d0, d1, ...] in a row.
   batch_.clear();
   batch_seq_.clear();
-  for (int i = 0; i < n_slots; ++i) {  // decode tokens first: one per decoding slot
-    const Slot& s = slots_[i];
-    if (!s.req || !s.req->decoding) continue;
-    batch_.push_back({s.req->next, i, static_cast<int>(s.cache.size()), true});
-    batch_seq_.push_back(i);
+  for (Proposal& p : props_) {
+    const Slot& s = slots_[p.seq];
+    const int P = static_cast<int>(s.cache.size());
+    p.root = static_cast<int>(batch_.size());
+    batch_.push_back({s.req->next, p.seq, P, true});
+    for (int i = 0; i < p.kk; ++i) {
+      if (p.greedy) {
+        const int par = i == 0 ? p.root : p.root + 2 * i - 1;
+        batch_.push_back({p.chain[i], p.seq, P + 1 + i, true, P + 1 + 2 * i, par});
+        batch_.push_back({p.alt[i], p.seq, P + 1 + i, true, P + 2 + 2 * i, par});
+      } else {
+        batch_.push_back({p.chain[i], p.seq, P + 1 + i, true});
+      }
+    }
   }
+  const int decode_rows = static_cast<int>(batch_.size());
   for (int i = 0; i < n_slots; ++i) {  // then prompt chunks in slot order, up to kMaxBatch tokens
     const Slot& s = slots_[i];
     if (!s.req || s.req->decoding) continue;
@@ -279,17 +379,92 @@ void Engine::step() {
   if (n == 0) return;
   omp_set_num_threads(n > 16 ? threads_batch_ : threads_);
   model_->forward(batch_.data(), n, logits_.data());
-  for (const BatchToken& b : batch_) slots_[b.seq].cache.push_back(b.id);
-  for (size_t row = 0; row < batch_seq_.size(); ++row) {
-    Slot& s = slots_[batch_seq_[row]];
+  for (int t = decode_rows; t < n; ++t) slots_[batch_[t].seq].cache.push_back(batch_[t].id);
+
+  // Prompts that finished: first token.
+  for (size_t j = 0; j < batch_seq_.size(); ++j) {
+    Slot& s = slots_[batch_seq_[j]];
     Request& q = *s.req;
-    if (!q.decoding) {
-      q.r.prefill_ms = ms_since(q.t0);
-      q.t1 = Clock::now();
-      q.decoding = true;
-    }
-    q.next = q.sampler.sample(logits_.data() + row * n_vocab, n_vocab);
+    q.r.prefill_ms = ms_since(q.t0);
+    q.t1 = Clock::now();
+    q.decoding = true;
+    q.next = q.sampler.sample(logits_.data() + (decode_rows + j) * n_vocab, n_vocab);
     if (!q.emit(q.next, *tok_, s.cache.size(), n_ctx)) finish(s);
+  }
+
+  // Decoding slots: accept the longest verified path, then the next token.
+  Dist p;
+  for (const Proposal& pr : props_) {
+    Slot& s = slots_[pr.seq];
+    Request& q = *s.req;
+    auto& cache = s.cache;
+    const int P = static_cast<int>(cache.size());
+    auto row = [&](int t) { return logits_.data() + static_cast<size_t>(pr.root + t) * n_vocab; };
+    auto emit = [&](int32_t id) { return q.emit(id, *tok_, cache.size(), n_ctx); };
+    cache.push_back(q.next);
+    q.r.drafted += pr.kk;
+    bool go = true;
+    if (pr.kk == 0) {
+      q.next = q.sampler.sample(row(0), n_vocab);
+    } else if (pr.greedy) {
+      int cur = 0, i = 0;
+      bool bonus_ready = false;
+      for (; i < pr.kk; ++i) {
+        q.sampler.distribution(row(cur), n_vocab, p);
+        const int32_t a = p[0].second;
+        int slot = -1;
+        if (a == pr.chain[i])
+          slot = 1 + 2 * i;
+        else if (a == pr.alt[i])
+          slot = 2 + 2 * i;
+        if (slot < 0) {
+          q.next = a;
+          bonus_ready = true;
+          break;
+        }
+        model_->move_kv(P + slot, static_cast<int>(cache.size()), pr.seq);
+        cache.push_back(a);
+        ++q.r.accepted;
+        cur = slot;
+        go = emit(a);
+        if (!go) break;
+        if (slot == 2 + 2 * i) {  // alternative leaf: nothing below it
+          ++i;
+          break;
+        }
+      }
+      if (go && !bonus_ready) {
+        q.sampler.distribution(row(cur), n_vocab, p);
+        q.next = p[0].second;
+      }
+      if (i == pr.kk && pr.kk == q.k && cur == 2 * pr.kk - 1)
+        q.k = std::min(q.k + 1, n_draft_);
+      else if (2 * i < pr.kk)
+        q.k = std::max(1, q.k - 1);
+    } else {
+      int i = 0;
+      for (; i < pr.kk; ++i) {
+        q.sampler.distribution(row(i), n_vocab, p);
+        bool ok = false;
+        const int32_t t = q.sampler.verify(p, pr.qd[i], pr.chain[i], ok);
+        if (!ok) {
+          q.next = t;
+          break;
+        }
+        ++q.r.accepted;
+        cache.push_back(t);
+        go = emit(t);
+        if (!go) break;
+      }
+      if (go && i == pr.kk) q.next = q.sampler.sample(row(pr.kk), n_vocab);
+      // Adapt the draft length: grow after a fully accepted step, shrink when most drafts fail.
+      if (i == pr.kk && pr.kk == q.k)
+        q.k = std::min(q.k + 1, n_draft_);
+      else if (2 * i < pr.kk)
+        q.k = std::max(1, q.k - 1);
+    }
+    if (go) go = emit(q.next);
+    if (!go) finish(s);
   }
 }
 
@@ -302,161 +477,6 @@ void Engine::finish(Slot& s) {
   q.done.set_value(std::move(q.r));
   s.req.reset();
   --busy_;
-}
-
-void Engine::spec_step(int seq) {
-  Slot& s = slots_[seq];
-  Request& q = *s.req;
-  auto& cache = s.cache;
-  const int n_ctx = model_->n_ctx(), n_vocab = model_->cfg().n_vocab;
-  auto emit = [&](int32_t id) { return q.emit(id, *tok_, cache.size(), n_ctx); };
-  omp_set_num_threads(threads_);
-  Dist p;
-  bool go = true;
-  if (q.req.sampling.temperature <= 0.0f) {
-    // Greedy tree speculation: the draft's top-1 chain plus its top-2 alternative at every depth (free, same
-    // draft logits), verified in one target pass. Accepts the longest path the target's argmax follows.
-    std::vector<int32_t> batch, chain, alt;
-    std::vector<int> parent;
-    const int dv = draft_->cfg().n_vocab;
-    const int room = std::min(q.budget - q.r.completion_tokens, (n_ctx - static_cast<int>(cache.size()) - 2) / 2);
-    const int kk = std::max(0, std::min(q.k, room));
-    if (kk > 0) {
-      std::vector<int32_t> ctx = cache;
-      ctx.push_back(q.next);
-      draft_sync(ctx);
-      for (int i = 0; i < kk; ++i) {
-        int32_t a = 0, b = 1;
-        if (dlogits_[b] > dlogits_[a]) std::swap(a, b);
-        for (int32_t v = 2; v < dv; ++v) {
-          if (dlogits_[v] > dlogits_[a])
-            b = a, a = v;
-          else if (dlogits_[v] > dlogits_[b])
-            b = v;
-        }
-        chain.push_back(a);
-        alt.push_back(b);
-        if (i + 1 < kk) {
-          draft_->forward(&a, 1, static_cast<int>(dcache_.size()), dlogits_.data(), false);
-          dcache_.push_back(a);
-        }
-      }
-    }
-    // Layout: [next, chain0, alt0, chain1, alt1, ...]; chain i at 1 + 2i, alt i at 2 + 2i.
-    batch.assign(1, q.next);
-    parent.assign(1, -1);
-    for (int i = 0; i < kk; ++i) {
-      const int par = i == 0 ? 0 : 2 * i - 1;
-      batch.push_back(chain[i]);
-      parent.push_back(par);
-      batch.push_back(alt[i]);
-      parent.push_back(par);
-    }
-    const int pos0 = static_cast<int>(cache.size());
-    model_->forward(batch.data(), static_cast<int>(batch.size()), pos0, vlogits_.data(), true, parent.data(), seq);
-    cache.push_back(q.next);
-    q.r.drafted += kk;
-    int cur = 0, i = 0;
-    bool bonus_ready = false;
-    for (; i < kk; ++i) {
-      q.sampler.distribution(vlogits_.data() + static_cast<size_t>(cur) * n_vocab, n_vocab, p);
-      const int32_t a = p[0].second;
-      int slot = -1;
-      if (a == chain[i])
-        slot = 1 + 2 * i;
-      else if (a == alt[i])
-        slot = 2 + 2 * i;
-      if (slot < 0) {
-        q.next = a;
-        bonus_ready = true;
-        break;
-      }
-      model_->move_kv(pos0 + slot, static_cast<int>(cache.size()), seq);
-      cache.push_back(a);
-      ++q.r.accepted;
-      cur = slot;
-      go = emit(a);
-      if (!go) break;
-      if (slot == 2 + 2 * i) {  // alternative leaf: nothing below it
-        ++i;
-        break;
-      }
-    }
-    if (go) {
-      if (!bonus_ready) {
-        q.sampler.distribution(vlogits_.data() + static_cast<size_t>(cur) * n_vocab, n_vocab, p);
-        q.next = p[0].second;
-      }
-      if (i == kk && kk == q.k && cur == 2 * kk - 1)
-        q.k = std::min(q.k + 1, n_draft_);
-      else if (2 * i < kk)
-        q.k = std::max(1, q.k - 1);
-      go = emit(q.next);
-    }
-  } else {
-    // Speculative sampling: draft up to k tokens after cache + next (no further than the budget and context allow).
-    std::vector<int32_t> batch;
-    std::vector<Dist> qd;
-    const int room = std::min(q.budget - q.r.completion_tokens, n_ctx - static_cast<int>(cache.size()) - 2);
-    const int kk = std::max(0, std::min(q.k, room));
-    batch.assign(1, q.next);
-    qd.resize(kk);
-    if (kk > 0) {
-      std::vector<int32_t> ctx = cache;
-      ctx.push_back(q.next);
-      draft_sync(ctx);
-      for (int i = 0; i < kk; ++i) {
-        q.dsampler->distribution(dlogits_.data(), draft_->cfg().n_vocab, qd[i]);
-        const int32_t d = q.dsampler->draw(qd[i]);
-        batch.push_back(d);
-        if (i + 1 < kk) {
-          draft_->forward(&d, 1, static_cast<int>(dcache_.size()), dlogits_.data(), false);
-          dcache_.push_back(d);
-        }
-      }
-    }
-    // One target pass over next + drafts: logits for every position.
-    const int nb = static_cast<int>(batch.size());
-    model_->forward(batch.data(), nb, static_cast<int>(cache.size()), vlogits_.data(), true, nullptr, seq);
-    cache.push_back(q.next);
-    q.r.drafted += nb - 1;
-    int i = 0;
-    for (; i < nb - 1; ++i) {
-      q.sampler.distribution(vlogits_.data() + static_cast<size_t>(i) * n_vocab, n_vocab, p);
-      bool ok = false;
-      const int32_t t = q.sampler.verify(p, qd[i], batch[i + 1], ok);
-      if (!ok) {
-        q.next = t;
-        break;
-      }
-      ++q.r.accepted;
-      cache.push_back(t);
-      go = emit(t);
-      if (!go) break;
-    }
-    if (go) {
-      if (i == nb - 1) q.next = q.sampler.sample(vlogits_.data() + static_cast<size_t>(nb - 1) * n_vocab, n_vocab);
-      // Adapt the draft length: grow after a fully accepted step, shrink when most drafts fail.
-      if (i == nb - 1 && nb - 1 == q.k)
-        q.k = std::min(q.k + 1, n_draft_);
-      else if (2 * i < nb - 1)
-        q.k = std::max(1, q.k - 1);
-      go = emit(q.next);
-    }
-  }
-  if (!go) finish(s);
-}
-
-void Engine::draft_sync(const std::vector<int32_t>& ctx) {
-  size_t common = 0;
-  while (common < dcache_.size() && common < ctx.size() && dcache_[common] == ctx[common]) ++common;
-  common = std::min(common, ctx.size() - 1);
-  dcache_.resize(common);
-  for (size_t i = common; i < ctx.size(); i += Model::kMaxBatch) {
-    const int n = static_cast<int>(std::min<size_t>(Model::kMaxBatch, ctx.size() - i));
-    draft_->forward(ctx.data() + i, n, static_cast<int>(i), dlogits_.data(), false);
-  }
-  dcache_ = ctx;
 }
 
 double Engine::perplexity(const std::string& text, int window, int* scored) {

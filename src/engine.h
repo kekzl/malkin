@@ -45,7 +45,7 @@ struct GenResult {
 using OnText = std::function<bool(const std::string&)>;
 
 // One model, up to `parallel` requests in flight: each step evaluates every active sequence in one forward pass
-// (decode tokens plus prompt chunks). A request alone with a draft model decodes speculatively. Each slot reuses
+// (decode tokens, with a draft model their speculative trees, plus prompt chunks). Each slot reuses
 // the KV of the longest common token prefix with its previous request.
 class Engine {
  public:
@@ -71,6 +71,7 @@ class Engine {
     std::vector<int32_t> cache;    // tokens whose KV is valid in this sequence
     std::unique_ptr<Request> req;  // null: idle
     uint64_t used = 0;             // admission counter, for least-recently-used reuse
+    std::vector<int32_t> dcache;   // tokens whose draft KV is valid
   };
 
   // All compute runs on one worker thread: one OpenMP pool. A pool per HTTP thread ran decode at
@@ -89,14 +90,13 @@ class Engine {
   void worker_loop();
   // Puts r into the idle slot with the longest common prompt prefix.
   void admit(std::unique_ptr<Request> r);
-  // One forward pass over all busy slots: a decode token each, then prompt chunks up to kMaxBatch tokens.
+  // One forward pass over all busy slots: per decoding slot its token plus the draft's proposal (greedy: chain and
+  // runner-up tree; sampled: chain), then prompt chunks, up to kMaxBatch tokens. Accepts per slot.
   void step();
-  // One speculative round for the only busy slot, which is decoding (needs a draft model).
-  void spec_step(int seq);
+  // Draft proposals for every decoding slot with kk > 0, batched across slots (draft sequence = slot).
+  void propose();
   void finish(Slot& s);
   double perplexity_locked(const std::string& text, int window, int* scored);
-  // Bring the draft KV to ctx (common prefix reuse); its logits then predict the token after ctx.
-  void draft_sync(const std::vector<int32_t>& ctx);
 
   std::mutex qmu_;
   std::condition_variable qcv_;
@@ -114,12 +114,19 @@ class Engine {
   int busy_ = 0;             // slots with a request (worker thread only)
   uint64_t admitted_ = 0;
   std::vector<BatchToken> batch_;
-  std::vector<int> batch_seq_;  // slot of each logits row in the last step
+  std::vector<int> batch_seq_;  // prompt-finishing slot of each logits row after the decode rows
+  struct Proposal {
+    int seq = 0, kk = 0, root = 0;  // slot, draft tokens, batch index of the slot's next token
+    bool greedy = true;
+    std::vector<int32_t> chain, alt;
+    std::vector<Dist> qd;  // sampled: draft distribution of each chain token
+  };
+  std::vector<Proposal> props_;
   std::vector<float> logits_;
   std::unique_ptr<GgufFile> dfile_;
   std::unique_ptr<Model> draft_;
-  std::vector<int32_t> dcache_;
-  std::vector<float> dlogits_, vlogits_;
+  std::vector<BatchToken> dbatch_;
+  std::vector<float> dlogits_, dout_;  // draft logits per slot, draft forward output
   int n_draft_ = 8;
   int threads_ = 0, threads_batch_ = 0;
   std::string model_id_;
