@@ -37,10 +37,10 @@ RUN ctest --test-dir build --output-on-failure
 FROM build AS bundle-build
 ARG VERSION=dev
 ARG TARGETARCH
-COPY LICENSE README.md ./
+COPY LICENSE README.md CHANGELOG.md ./
 RUN set -e; a=x86_64; [ "$TARGETARCH" = arm64 ] && a=aarch64; d=malkin-$VERSION-linux-$a; \
     mkdir -p /dist/$d/bin /dist/$d/lib /dist/$d/libexec; \
-    cp /out/malkin /dist/$d/libexec/; cp /out/lib/* /dist/$d/lib/; cp LICENSE README.md /dist/$d/; \
+    cp /out/malkin /dist/$d/libexec/; cp /out/lib/* /dist/$d/lib/; cp LICENSE README.md CHANGELOG.md /dist/$d/; \
     printf '#!/bin/sh\nd=$(dirname "$(readlink -f "$0")")/..\nLD_LIBRARY_PATH="$d/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" exec "$d/libexec/malkin" "$@"\n' > /dist/$d/bin/malkin; \
     chmod +x /dist/$d/bin/malkin; \
     tar -C /dist -czf /dist/$d.tar.gz $d && (cd /dist && sha256sum $d.tar.gz > $d.tar.gz.sha256) && rm -rf /dist/$d

@@ -22,7 +22,7 @@ Build and run only in Docker; the host has no compiler. Pass `--user $(id -u):$(
 | Correctness | `malkin ppl --model M -f /models/ppl_4k.txt --window 512` vs `docker run --rm -v /home/kekz/models:/models:ro ghcr.io/ggml-org/llama.cpp:full --perplexity -m M -f /models/ppl_4k.txt -c 512` |
 | Speed | `tools/bench_vs_llama.sh HOST_GGUF 512 128 2` (prefill + decode, back to back); `tools/bench_decode.sh TARGET DRAFT` (4 prompts, plain vs draft vs llama.cpp tg128); `bench_gemm [n] [threads]` (kernel TMAC/s) |
 | Lint | `tools/lint.sh` in the deps image: clang-format, clang-tidy (bugprone, performance, warnings are errors), shellcheck; CI adds actionlint |
-| Release | publishing a GitHub release runs `.github/workflows/release.yml`: ghcr.io image amd64 + arm64 (SBOM, provenance, cosign) and signed tarballs (`--target bundle`) |
+| Release | bump `project(VERSION)` in `CMakeLists.txt`, add a `CHANGELOG.md` section, then `gh release create vX.Y.Z --notes-file <section>`; `.github/workflows/release.yml` pushes `ghcr.io/kekzl/malkin:X.Y.Z`, `X.Y`, `latest` (amd64 + arm64, SBOM, provenance, cosign) and attaches signed tarballs (`--target bundle`) |
 
 Models live in `/home/kekz/models` (mount read-only at `/models`). Reference model: `Qwen3-4B-Instruct-2507-Q8_0.gguf`, PPL 18.0120 (llama.cpp 18.0256).
 
@@ -30,7 +30,7 @@ Models live in `/home/kekz/models` (mount read-only at `/models`). Reference mod
 
 Request path: `server.cpp` (httplib handler) -> `Engine::generate` (mutex, then `on_worker`) -> prefix match against `cache_` -> `Model::forward` in chunks of `kMaxBatch` = 256 -> `matmul` -> `kern::*`.
 
-- **One compute thread.** All model work runs on the engine worker thread so there is one OpenMP pool. OpenMP thread counts are per calling thread: a pool per HTTP thread ran decode at 7.2 instead of 13.2 tok/s. Decode uses physical cores, prefill (> 16 new tokens) all logical CPUs; `omp_set_num_threads` is set per phase in `engine.cpp`.
+- **One compute thread.** All model work runs on the engine worker thread so there is one OpenMP pool. OpenMP thread counts are per calling thread: a pool per HTTP thread ran decode at 7.2 instead of 13.2 tok/s. Decode and prefill both default to physical cores (SMT prefill: 188.7 vs 348.1 tok/s); `omp_set_num_threads` is set per phase in `engine.cpp`.
 - **ISA split.** `kernels.h` is the only ISA boundary; CMake picks `kernels_avx512.cpp` or `kernels_neon.cpp` from `CMAKE_SYSTEM_PROCESSOR`. Everything else is portable C++ (no intrinsics in `model.cpp`, `quant.cpp`). A new weight type needs: scalar `dequantize_row` (the reference), a dot kernel in both ISA files, dispatch in `vec_dot`, a case in `tests/test_quant.cpp`.
 - **Activations.** `BlockQ8` = 32 int8 + float scale + int16 sums of each 16-value half. The sums carry the K-quant min terms (Q4_K/Q5_K `dmin*m`) and the AVX-512 Q6_K `-32` bias, so kernels never sign-extend weights. llama.cpp uses Q8_K (256-value scale) for K-quants, so PPL vs llama.cpp differs by up to ~0.5 % there; Q8_0 and Q6_K match within 0.1 %.
 - **Weights** stay in the mmap'd GGUF (`Weight` is a view); load-time `prefetch` first-touches pages in parallel for NUMA spread. KV cache is BF16, `[layer][pos][kv_head*head_dim]`.

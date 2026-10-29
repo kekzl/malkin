@@ -59,15 +59,29 @@ Four prompt types (explanation, code, list, summary), 200 greedy tokens each. ll
 ## Quick start
 
 ```bash
-docker build -t malkin:local .
 docker run --rm -p 127.0.0.1:8080:8080 -v /path/to/models:/models:ro \
-  malkin:local --model /models/Qwen3-4B-Instruct-2507-Q8_0.gguf
+  ghcr.io/kekzl/malkin:latest --model /models/Qwen3-8B-Q8_0.gguf --draft /models/qwen3-0.6b-q4_k_m.gguf
 
 curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"model":"x","messages":[{"role":"user","content":"Hello!"}],"max_tokens":64}'
 ```
 
-arm64 image from an amd64 host, cross-compiled, no emulation: `docker buildx build --platform linux/arm64 -t malkin:arm64 .`
+| Install | How |
+|---|---|
+| Image | `ghcr.io/kekzl/malkin:<version>` or `:latest`, one manifest for `linux/amd64` and `linux/arm64` |
+| Binary | `malkin-<version>-linux-{x86_64,aarch64}.tar.gz` from [Releases](https://github.com/kekzl/malkin/releases), unpack, run `bin/malkin` (libc++ and libomp bundled, needs glibc 2.38+) |
+| Source | `docker build -t malkin:local .`; arm64 from an amd64 host, cross-compiled: `docker buildx build --platform linux/arm64 -t malkin:arm64 .` |
+
+Release images and tarballs are signed keyless with cosign:
+
+```bash
+cosign verify ghcr.io/kekzl/malkin:latest --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github\.com/kekzl/malkin/\.github/workflows/release\.yml@refs/tags/'
+cosign verify-blob --bundle malkin-0.1.0-linux-x86_64.tar.gz.sigstore.json \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github\.com/kekzl/malkin/\.github/workflows/release\.yml@refs/tags/' \
+  malkin-0.1.0-linux-x86_64.tar.gz
+```
 
 ## What it serves
 
