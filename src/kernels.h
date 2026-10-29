@@ -34,6 +34,9 @@ float dot_q4_k(int64_t k, const uint8_t* w, const BlockQ8* x);
 float dot_q5_k(int64_t k, const uint8_t* w, const BlockQ8* x);
 float dot_q6_k(int64_t k, const uint8_t* w, const BlockQ8* x);
 
+// SwiGLU gate: g[i] = g[i] / (1 + e^-g[i]) * u[i].
+void silu_mul(int64_t n, float* g, const float* u);
+
 // Attention helpers on BF16 KV rows; n is a multiple of 16.
 float dot_f32_bf16(const float* q, const uint16_t* k, int n);
 void axpy_bf16(float a, const uint16_t* v, float* y, int n);
@@ -55,6 +58,8 @@ void pack_panel(GgmlType t, bool wide, const uint8_t* src, size_t src_stride, in
                 uint8_t* dst);
 // Tokens per gemm_panels call for t (<= 8).
 int gemm_tile(GgmlType t, bool wide);
+// True: gemm_panels for (t, wide) reads activation bytes as unsigned qs + 128 (caller passes qs ^ 0x80).
+bool gemm_unsigned_acts(GgmlType t, bool wide);
 // np (1 or 2) consecutive panels, panel_bytes apart: y[t * y_stride + r] = row r . x[t] for t < n (n <= gemm_tile),
 // r < rows_valid (<= np * panel_rows()); x has cols/32 blocks per token.
 void gemm_panels(GgmlType t, bool wide, const uint8_t* panel, size_t panel_bytes, int np, int64_t cols,

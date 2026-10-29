@@ -179,7 +179,8 @@ void axpy_bf16(float a, const uint16_t* v, float* y, int n) {
 
 namespace {
 
-// e^x for x <= 0 (softmax after max subtraction): Cody-Waite range reduction, degree-6 Taylor, rel err ~1e-7.
+// e^x (softmax after max subtraction, SiLU): Cody-Waite range reduction, degree-6 Taylor, rel err ~1e-7;
+// clamped to e^-87 below, +inf above 88.
 inline __m512 exp512(__m512 x) {
   x = _mm512_max_ps(x, _mm512_set1_ps(-87.0f));
   const __m512 n = _mm512_roundscale_ps(_mm512_mul_ps(x, _mm512_set1_ps(1.44269504088896341f)),
@@ -260,6 +261,17 @@ void attend_t(const float* q, int G, const uint16_t* k, const uint16_t* v, size_
 }
 
 }  // namespace
+
+void silu_mul(int64_t n, float* g, const float* u) {
+  int64_t i = 0;
+  for (; i + 16 <= n; i += 16) {
+    const __m512 x = _mm512_loadu_ps(g + i);
+    const __m512 e = exp512(_mm512_sub_ps(_mm512_setzero_ps(), x));
+    _mm512_storeu_ps(g + i,
+                     _mm512_mul_ps(_mm512_div_ps(x, _mm512_add_ps(_mm512_set1_ps(1.0f), e)), _mm512_loadu_ps(u + i)));
+  }
+  for (; i < n; ++i) g[i] = g[i] / (1.0f + std::exp(-g[i])) * u[i];
+}
 
 void attend_gqa(const float* q, int G, int D, const uint16_t* k, const uint16_t* v, size_t stride, int n, float scale,
                 float* out, float* scratch, const int* extra, int ne) {

@@ -51,14 +51,14 @@ void rmsnorm(float* y, const float* x, const float* w, int n, float eps) {
 // MALKIN_PROFILE=1: wall time per forward stage, printed at exit.
 struct Prof {
   bool on = std::getenv("MALKIN_PROFILE") != nullptr;
-  double ms[7] = {};
+  double ms[8] = {};
   ~Prof() {
     if (!on) return;
-    static const char* names[7] = {"norm+qkv", "qk-norm/rope/kv", "attention", "wo+res+norm",
-                                   "gate+up",  "silu+down",       "output"};
+    static const char* names[8] = {"norm+qkv", "qk-norm/rope/kv", "attention", "wo+res+norm",
+                                   "gate+up",  "silu+quant",      "down",      "output"};
     double total = 0;
     for (double v : ms) total += v;
-    for (int i = 0; i < 7; ++i)
+    for (int i = 0; i < 8; ++i)
       std::fprintf(stderr, "profile %-16s %9.1f ms %5.1f %%\n", names[i], ms[i], 100 * ms[i] / total);
   }
 } g_prof;
@@ -224,6 +224,12 @@ void Model::forward(const int32_t* tokens, int n, int pos, float* logits, bool a
       v[i + D / 2] = x0 * sn[i] + x1 * cs[i];
     }
   };
+  // x += h over n tokens, threaded.
+  auto add_residual = [&](int n_tok) {
+    const size_t ne = static_cast<size_t>(n_tok) * E;
+#pragma omp parallel for schedule(static) if (n_tok > 1)
+    for (size_t i = 0; i < ne; ++i) x_[i] += h_[i];
+  };
 
   Lap lap;
   // Decoder layers.
@@ -266,7 +272,7 @@ void Model::forward(const int32_t* tokens, int n, int pos, float* logits, bool a
     quantize_acts(att_.data(), n, static_cast<int64_t>(H) * D, xq_);
     matmul(L.wo, att_.data(), xq_.data(), n, h_.data());
     lap(3);
-    for (size_t i = 0; i < static_cast<size_t>(n) * E; ++i) x_[i] += h_[i];
+    add_residual(n);
 
 #pragma omp parallel for schedule(static) if (n > 1)
     for (int t = 0; t < n; ++t) rmsnorm(h_.data() + t * E, x_.data() + t * E, L.ffn_norm, E, c.rms_eps);
@@ -275,16 +281,14 @@ void Model::forward(const int32_t* tokens, int n, int pos, float* logits, bool a
     matmul(L.w_gate, h_.data(), xq_.data(), n, gate_.data());
     matmul(L.w_up, h_.data(), xq_.data(), n, up_.data());
     lap(4);
-    const size_t nf = static_cast<size_t>(n) * F;
-#pragma omp parallel for schedule(static)
-    for (size_t i = 0; i < nf; ++i) {
-      float g = gate_[i];
-      gate_[i] = g / (1.0f + std::exp(-g)) * up_[i];
-    }
+#pragma omp parallel for schedule(static) if (n > 1)
+    for (int t = 0; t < n; ++t)
+      kern::silu_mul(F, gate_.data() + static_cast<size_t>(t) * F, up_.data() + static_cast<size_t>(t) * F);
     quantize_acts(gate_.data(), n, F, xq_);
-    matmul(L.w_down, gate_.data(), xq_.data(), n, h_.data());
     lap(5);
-    for (size_t i = 0; i < static_cast<size_t>(n) * E; ++i) x_[i] += h_[i];
+    matmul(L.w_down, gate_.data(), xq_.data(), n, h_.data());
+    lap(6);
+    add_residual(n);
   }
 
   // Final norm and LM head for the last token (or all tokens for perplexity).
@@ -293,7 +297,7 @@ void Model::forward(const int32_t* tokens, int n, int pos, float* logits, bool a
   for (int t = first; t < n; ++t) rmsnorm(h_.data() + (t - first) * E, x_.data() + t * E, output_norm_, E, c.rms_eps);
   quantize_acts(h_.data(), m, E, xq_);
   matmul(output_, h_.data(), xq_.data(), m, logits);
-  lap(6);
+  lap(7);
 }
 
 }  // namespace malkin

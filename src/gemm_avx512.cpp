@@ -208,8 +208,11 @@ void k_q6_k(const uint8_t* p, size_t pb, int64_t cols, const BlockQ8* x, float* 
 
 // Q4_K/Q5_K wide: d, dmin f32[16]; per sub-block sc, m u8[16]; 64 groups x 64 bytes q (0..31).
 constexpr size_t kQ45WBlock = 64 + 64 + 256 + 64 * 64;
-// Q6_K wide: d f32[16]; int8 scale [16 h][16 rows]; 64 groups x 64 bytes q (0..63, bias 32).
-constexpr size_t kQ6WBlock = 64 + 256 + 64 * 64;
+// Q6_K wide: d f32 [16 rows]; scale i8 [16 h][16 rows]; -sum(q - 32) i16 [16 h][16 rows]; 64 groups x 64 bytes q - 32
+// (signed). Activations come as qs + 128 (gemm_unsigned_acts); the shift is a per-row constant, so no
+// per-token bias term remains.
+constexpr size_t kQ6WScale = 64, kQ6WCorr = kQ6WScale + 16 * 16, kQ6WQ = kQ6WCorr + 16 * 16 * 2,
+                 kQ6WBlock = kQ6WQ + 64 * 64;
 
 template <int NT, int NP>
 void k_q45_w(const uint8_t* p, size_t pb, int64_t cols, const BlockQ8* x, float* y, int64_t ys, int rv) {
@@ -270,37 +273,41 @@ void k_q6_w(const uint8_t* p, size_t pb, int64_t cols, const BlockQ8* x, float* 
     for (int t = 0; t < NT; ++t) acc[q][t] = _mm512_setzero_ps();
   for (int64_t sb = 0; sb < cols / 256; ++sb) {
     const uint8_t* pq[NP];
-    __m512 d[NP];
-    for (int q = 0; q < NP; ++q) {
-      pq[q] = p + q * pb + sb * kQ6WBlock;
-      d[q] = _mm512_loadu_ps(pq[q]);
-    }
-    for (int h = 0; h < 16; ++h) {
-      __m512 dsc[NP];
-      for (int q = 0; q < NP; ++q) {
-        dsc[q] = _mm512_mul_ps(d[q], _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(
-                                         _mm_loadu_si128(reinterpret_cast<const __m128i*>(pq[q] + 64 + 16 * h)))));
-      }
-      const int64_t xb = sb * 8 + h / 2;
-      const int off = (h & 1) * 16;
-      __m512i ai[NP][NT];
-      for (int q = 0; q < NP; ++q)
-        for (int t = 0; t < NT; ++t) ai[q][t] = _mm512_setzero_si512();
-      for (int gg = 0; gg < 4; ++gg) {
+    for (int q = 0; q < NP; ++q) pq[q] = p + q * pb + sb * kQ6WBlock;
+    // Per Q8 block: both 16-value halves as integer dots, then acc += dx * (dsc_0 * dot_0 + dsc_1 * dot_1).
+    // Scaling costs 3 FMA-port ops per 8 vpdpbusd; a subtract per half would add 2 more (12 % each, measured).
+    for (int b = 0; b < 8; ++b) {
+      const int64_t xb = sb * 8 + b;
+      __m512i ai[2][NP][NT];
+      // Integer accumulators start at -128 * sum(q - 32): the dots stay exact, no float cancellation.
+      for (int hh = 0; hh < 2; ++hh)
+        for (int q = 0; q < NP; ++q) {
+          const __m512i c = _mm512_slli_epi32(_mm512_cvtepi16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(
+                                                  pq[q] + kQ6WCorr + 32 * (2 * b + hh)))),
+                                              7);
+          for (int t = 0; t < NT; ++t) ai[hh][q][t] = c;
+        }
+      for (int g = 0; g < 8; ++g) {
+        const int hh = g / 4;
         __m512i w[NP];
-        for (int q = 0; q < NP; ++q) w[q] = _mm512_loadu_si512(pq[q] + 320 + (h * 4 + gg) * 64);
+        for (int q = 0; q < NP; ++q) w[q] = _mm512_loadu_si512(pq[q] + kQ6WQ + (b * 8 + g) * 64);
         for (int t = 0; t < NT; ++t) {
-          const __m512i xv = _mm512_set1_epi32(ld32(x[t * nb + xb].qs + off + 4 * gg));
-          for (int q = 0; q < NP; ++q) ai[q][t] = _mm512_dpbusd_epi32(ai[q][t], w[q], xv);
+          const __m512i xv = _mm512_set1_epi32(ld32(x[t * nb + xb].qs + 4 * g));
+          for (int q = 0; q < NP; ++q) ai[hh][q][t] = _mm512_dpbusd_epi32(ai[hh][q][t], xv, w[q]);
         }
       }
-      for (int t = 0; t < NT; ++t) {
-        const BlockQ8& xq = x[t * nb + xb];
-        const __m512i bias = _mm512_set1_epi32(32 * xq.s[h & 1]);
-        const __m512 dx = _mm512_set1_ps(xq.d);
-        for (int q = 0; q < NP; ++q)
-          acc[q][t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(ai[q][t], bias)), _mm512_mul_ps(dsc[q], dx),
-                                      acc[q][t]);
+      for (int q = 0; q < NP; ++q) {
+        const __m512 d = _mm512_loadu_ps(pq[q]);
+        const auto dsc = [&](int h) {
+          return _mm512_mul_ps(d, _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(
+                                      _mm_loadu_si128(reinterpret_cast<const __m128i*>(pq[q] + kQ6WScale + 16 * h)))));
+        };
+        const __m512 d0 = dsc(2 * b), d1 = dsc(2 * b + 1);
+        for (int t = 0; t < NT; ++t) {
+          const __m512 s =
+              _mm512_fmadd_ps(_mm512_cvtepi32_ps(ai[1][q][t]), d1, _mm512_mul_ps(_mm512_cvtepi32_ps(ai[0][q][t]), d0));
+          acc[q][t] = _mm512_fmadd_ps(s, _mm512_set1_ps(x[t * nb + xb].d), acc[q][t]);
+        }
       }
     }
   }
@@ -311,7 +318,8 @@ void k_q6_w(const uint8_t* p, size_t pb, int64_t cols, const BlockQ8* x, float* 
 using Kernel = void (*)(const uint8_t*, size_t, int64_t, const BlockQ8*, float*, int64_t, int);
 
 // Token tile per kernel (register budget: NP=2 x NT int + float accumulators within 32 zmm).
-constexpr int kTileQ8_0 = 6, kTileQK = 4, kTileWide = 6;
+// Q6_K wide: 2 halves x NP x NT int accumulators + NP x NT float; NT = 3 is latency-bound (0.32 vs 0.42 TMAC/s).
+constexpr int kTileQ8_0 = 6, kTileQK = 4, kTileWide = 6, kTileQ6W = 4;
 
 template <template <int, int> class K, int NP, int... N>
 constexpr auto table(std::integer_sequence<int, N...>) {
@@ -338,7 +346,7 @@ struct Tables {
   static constexpr auto q5k = table<KQ5K, NP>(std::make_integer_sequence<int, kTileQK>{});
   static constexpr auto q6k = table<KQ6K, NP>(std::make_integer_sequence<int, kTileQK>{});
   static constexpr auto q45w = table<KQ45W, NP>(std::make_integer_sequence<int, kTileWide>{});
-  static constexpr auto q6w = table<KQ6W, NP>(std::make_integer_sequence<int, kTileWide>{});
+  static constexpr auto q6w = table<KQ6W, NP>(std::make_integer_sequence<int, kTileQ6W>{});
 };
 
 template <int NP>
@@ -481,8 +489,17 @@ void pack_q6_w(const uint8_t* src, size_t ss, int rv, int64_t cols, uint8_t* dst
     for (int r = 0; r < rv; ++r) {
       const uint8_t* s = src + r * ss + sb * 210;
       put_f32(pb + 4 * r, fp16_to_fp32(ld16(s + 208)));
-      for (int h = 0; h < 16; ++h) pb[64 + 16 * h + r] = s[192 + h];
-      for (int k = 0; k < 256; ++k) pb[320 + (k / 4) * 64 + 4 * r + k % 4] = static_cast<uint8_t>(q6_value(s, k));
+      for (int h = 0; h < 16; ++h) {
+        pb[kQ6WScale + 16 * h + r] = s[192 + h];
+        int wsum = 0;
+        for (int k = 16 * h; k < 16 * h + 16; ++k) {
+          const int w = q6_value(s, k) - 32;
+          wsum += w;
+          pb[kQ6WQ + (k / 4) * 64 + 4 * r + k % 4] = static_cast<uint8_t>(static_cast<int8_t>(w));
+        }
+        const auto c = static_cast<int16_t>(-wsum);  // kernel shifts left by 7: -128 * sum
+        std::memcpy(pb + kQ6WCorr + 32 * h + 2 * r, &c, 2);
+      }
     }
   }
 }
@@ -526,7 +543,12 @@ void pack_panel(GgmlType t, bool wide, const uint8_t* src, size_t ss, int rv, in
   }
 }
 
-int gemm_tile(GgmlType t, bool wide) { return wide ? kTileWide : t == GgmlType::Q8_0 ? kTileQ8_0 : kTileQK; }
+int gemm_tile(GgmlType t, bool wide) {
+  if (wide) return t == GgmlType::Q6_K ? kTileQ6W : kTileWide;
+  return t == GgmlType::Q8_0 ? kTileQ8_0 : kTileQK;
+}
+
+bool gemm_unsigned_acts(GgmlType t, bool wide) { return wide && t == GgmlType::Q6_K; }
 
 void gemm_panels(GgmlType t, bool wide, const uint8_t* p, size_t pb, int np, int64_t cols, const BlockQ8* x, int n,
                  float* y, int64_t ys, int rv) {

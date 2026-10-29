@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Q6_K wide (prefill) kernel: signed weights, activations + 128, the per-row shift preloaded into the integer accumulators, both 16-value halves scaled once per Q8 block.
+- Vectorized SiLU (`kern::silu_mul`), threaded residual adds.
+
+| pp512 tok/s, 9800X3D, 8 threads, best of 3 interleaved, host load 7-9 | 0.1.0 | now | llama.cpp |
+|---|---:|---:|---:|
+| Qwen3-14B Q6_K | 145.60 | 167.40 | 116.31 |
+| Qwen3-4B Q4_K_M | 493.00 | 513.50 | 241.07 |
+| Qwen3-4B Q8_0 | 476.80 | 506.70 | 116.83 |
+
 ## 0.1.0 (2026-10-29)
 
 First release. Qwen3 dense GGUF models on AVX-512 (Zen 4 / Zen 5, Sapphire Rapids+) and Arm Neoverse-N1+ CPUs.

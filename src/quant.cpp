@@ -225,6 +225,18 @@ void matmul(const Weight& w, const float* x, const BlockQ8* xq, int n, float* y)
     const int64_t panels = (w.rows + R - 1) / R;
     const int64_t groups = (panels + np - 1) / np;
     const int64_t nb = w.cols / 32;
+    if (kern::gemm_unsigned_acts(w.type, wide)) {
+      // Same blocks with qs ^ 0x80 (= qs + 128 as unsigned bytes); n * cols bytes, small next to the GEMM.
+      static thread_local std::vector<BlockQ8> ux;
+      if (ux.size() < static_cast<size_t>(n * nb)) ux.resize(n * nb);
+      BlockQ8* u = ux.data();  // thread_local: resolve on this thread, not inside the parallel region
+#pragma omp parallel for schedule(static)
+      for (int64_t i = 0; i < n * nb; ++i) {
+        u[i] = xq[i];
+        for (int8_t& v : u[i].qs) v = static_cast<int8_t>(static_cast<uint8_t>(v) ^ 0x80);
+      }
+      xq = u;
+    }
     // Work item: one panel group x one token chunk, all its tiles in a row (the group stays in L2).
     // Dynamic hand-out: with other tenants on some cores, static splits wait for the slowest thread
     // (14B Q6_K gate+up: 1.57 TMAC/s in the model vs 3.0 in isolation).

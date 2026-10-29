@@ -8,7 +8,7 @@ best() { sort -g | tail -1; }
 mp=(); mt=(); lp=(); lt=()
 for _ in $(seq "$RUNS"); do
   line=$(docker run --rm --user "$(id -u):$(id -g)" ${ENVV:+-e $ENVV} -v "$PWD:/src" -v "$(dirname "$F"):/m:ro" -w /src \
-    malkin-dev:local ./build-clang/malkin bench --model "$M" --ctx 4096 -pp "$PP" -tg "$TG" 2>/dev/null | tail -1)
+    malkin-dev:local ./"${MALKIN_BUILD:-build-clang}"/malkin bench --model "$M" --ctx 4096 -pp "$PP" -tg "$TG" 2>/dev/null | tail -1)
   mp+=("$(echo "$line" | awk -F'|' '{print $5}')"); mt+=("$(echo "$line" | awk -F'|' '{print $6}')")
   out=$(docker run --rm -v "$(dirname "$F"):/m:ro" --entrypoint /app/llama-bench ghcr.io/ggml-org/llama.cpp:full \
     -m "$M" -p "$PP" -n "$TG" -t 8 -r 1 -o csv 2>/dev/null)

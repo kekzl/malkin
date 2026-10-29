@@ -122,7 +122,7 @@ static bool check_bf16_helpers() {
 }
 
 // Panel GEMM vs row path: 19 rows (partial pair), 35 rows (pair + partial single), tokens across tile edges.
-static bool check_gemm(GgmlType t, int64_t k, int rows) {
+static bool check_gemm(GgmlType t, int64_t k, int rows, bool outliers = false) {
   if (kern::panel_bytes(t, k, false) == 0) return true;
 
   std::vector<uint8_t> data;
@@ -145,6 +145,9 @@ static bool check_gemm(GgmlType t, int64_t k, int rows) {
   for (int n : {1, 3, 4, 6, 7, 11, 17, 23}) {
     std::vector<float> x(n * k);
     for (auto& v : x) v = uf(rng);
+    // LLM-like activations: a few channels 100x larger, so most Q8 values in their blocks round to 0 or +-1.
+    if (outliers)
+      for (int64_t i = 0; i < n * k; i += 97) x[i] *= 100.0f;
     std::vector<BlockQ8> xq;
     quantize_acts(x.data(), n, k, xq);
     std::vector<float> y0(static_cast<size_t>(n) * rows), y1(static_cast<size_t>(n) * rows);
@@ -177,6 +180,6 @@ int main() {
   ok &= check(GgmlType::Q8_0, 96);  // odd block count: 256-bit tail
   ok &= check(GgmlType::F32, 100);  // scalar tail
   for (auto t : {GgmlType::Q8_0, GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K})
-    ok &= check_gemm(t, 512, 19) && check_gemm(t, 512, 35);
+    ok &= check_gemm(t, 512, 19) && check_gemm(t, 512, 35) && check_gemm(t, 5120, 35, true);
   return ok ? 0 : 1;
 }
