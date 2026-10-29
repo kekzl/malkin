@@ -299,4 +299,13 @@ void attend_gqa(const float* q, int G, int D, const uint16_t* k, const uint16_t*
   }
 }
 
+// One token per call: attend_t keeps a whole 512-bit key row in registers already.
+int attend_block_tokens(int) { return 1; }
+
+void attend_block(const float* q, size_t q_stride, int B, int G, int D, const uint16_t* k, const uint16_t* v,
+                  size_t stride, const int* n, float scale, float* out, float* scratch) {
+  for (int b = 0; b < B; ++b)
+    attend_gqa(q + b * q_stride, G, D, k, v, stride, n[b], scale, out + b * q_stride, scratch);
+}
+
 }  // namespace malkin::kern

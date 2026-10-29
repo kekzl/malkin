@@ -48,6 +48,14 @@ void axpy_bf16(float a, const uint16_t* v, float* y, int n);
 void attend_gqa(const float* q, int G, int D, const uint16_t* k, const uint16_t* v, size_t stride, int n, float scale,
                 float* out, float* scratch, const int* extra = nullptr, int ne = 0);
 
+// B consecutive query tokens of one sequence (prompt reading), same G heads: token b sees keys 0..n[b]-1.
+// Head h of token b at q + b * q_stride + h * D, out likewise; scratch: at least B * G * max(n) floats.
+// Shares each K/V row conversion across the B * G rows.
+void attend_block(const float* q, size_t q_stride, int B, int G, int D, const uint16_t* k, const uint16_t* v,
+                  size_t stride, const int* n, float scale, float* out, float* scratch);
+// Tokens per attend_block call for G heads per KV head; 1 = attend_gqa per token.
+int attend_block_tokens(int G);
+
 // Panel GEMM. A panel holds panel_rows() weight rows interleaved for the ISA's dot instruction.
 int panel_rows();
 // Two panel formats: compact (about the GGUF size, all n) and wide (one byte per weight, unpacked at load, for

@@ -6,6 +6,7 @@
 - Vectorized SiLU (`kern::silu_mul`), threaded residual adds.
 - Continuous batching: `serve --parallel N` (default 4) decodes concurrent requests in one forward pass per step, one KV sequence per slot with prefix reuse; 4B Q8_0 with 8 requests 100.07 tok/s vs llama-server 58.01. `tools/bench_parallel.sh`, `tools/check_parallel.sh`.
 - Speculative decoding for concurrent requests: draft proposals and tree verification batched across slots; Qwen3-8B Q8_0 + 0.6B draft, 4 requests 50.17 tok/s vs llama-server 23.42, 8 requests 73.06 vs 37.66.
+- NEON prompt attention in blocks (`attend_block`: 4 rows of token x head per K/V row conversion): N1 0.6B Q8_0 pp512 156.0 -> 214.8 tok/s, attention share 53.2 % -> 37.7 %.
 - NEON panel GEMM (Q8_0, Q4_K, Q6_K; `sdot` by lane, 16 rows per panel), vectorized NEON attention, softmax and SiLU. Neoverse-N1 VPS, 4 threads: 0.6B Q8_0 pp512 31.0 -> 158.3 tok/s, tg128 14.48 -> 21.93; 1.7B Q4_K_M pp512 16.7 -> 49.9 (llama.cpp 55.37).
 - `matmul_group`: q/k/v and gate/up in one parallel region (9800X3D 4B Q8_0 tg128 13.14 -> 13.36).
 - Auto context size measures free RAM after the packed weights are resident, counts the draft KV, and honors cgroup v2 limits (`docker --memory`, systemd `MemoryMax`). Before, Qwen3-1.7B Q4_K_M + 0.6B draft under `docker --memory 6g` picked ctx 32768 and was OOM-killed; now ctx 2464.
