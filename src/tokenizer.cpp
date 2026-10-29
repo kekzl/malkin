@@ -82,7 +82,7 @@ Tokenizer::Tokenizer(const GgufFile& f) {
   // GPT-2 byte <-> unicode mapping: printable bytes map to themselves, the rest to U+0100 onwards.
   uint32_t extra = 256;
   for (uint32_t b = 0; b < 256; ++b) {
-    bool printable = (b >= '!' && b <= '~') || (b >= 0xA1 && b <= 0xAC) || (b >= 0xAE && b <= 0xFF);
+    bool printable = (b >= '!' && b <= '~') || (b >= 0xA1 && b <= 0xAC) || b >= 0xAE;
     uint32_t cp = printable ? b : extra++;
     append_utf8(byte_enc_[b], cp);
     byte_dec_[cp] = static_cast<uint8_t>(b);

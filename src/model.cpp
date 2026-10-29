@@ -203,6 +203,7 @@ void Model::forward(const int32_t* tokens, int n, int pos, float* logits, bool a
   const int E = c.n_embd, D = c.head_dim, H = c.n_head, KV = c.n_head_kv, F = c.n_ff;
   const size_t kv_row = static_cast<size_t>(KV) * D;
 
+  // Token embeddings, then RoPE angles per token (tree mode: prefix + depth).
   for (int t = 0; t < n; ++t) {
     if (tokens[t] < 0 || tokens[t] >= tok_embd_.rows) throw std::runtime_error("forward: token id out of range");
     dequantize_row(tok_embd_.type, tok_embd_.row(tokens[t]), x_.data() + static_cast<size_t>(t) * E, E);
@@ -225,16 +226,19 @@ void Model::forward(const int32_t* tokens, int n, int pos, float* logits, bool a
   };
 
   Lap lap;
+  // Decoder layers.
   for (int il = 0; il < c.n_layer; ++il) {
     const Layer& L = layers_[il];
 #pragma omp parallel for schedule(static) if (n > 1)
     for (int t = 0; t < n; ++t) rmsnorm(h_.data() + t * E, x_.data() + t * E, L.attn_norm, E, c.rms_eps);
     quantize_acts(h_.data(), n, E, xq_);
+    // Pre-attention RMSNorm, Q8 activations shared by the Q, K, V projections.
     matmul(L.wq, h_.data(), xq_.data(), n, q_.data());
     matmul(L.wk, h_.data(), xq_.data(), n, k_.data());
     matmul(L.wv, h_.data(), xq_.data(), n, v_.data());
     lap(0);
 
+    // Q/K head norms, RoPE, then K and V into the cache at positions pos..pos+n-1.
     uint16_t* kc = kcache_.data() + (static_cast<size_t>(il) * n_ctx_ + pos) * kv_row;
     uint16_t* vc = vcache_.data() + (static_cast<size_t>(il) * n_ctx_ + pos) * kv_row;
 #pragma omp parallel for schedule(static) if (n > 1)
@@ -256,6 +260,7 @@ void Model::forward(const int32_t* tokens, int n, int pos, float* logits, bool a
     }
 
     lap(1);
+    // Attention over the BF16 KV cache, output projection, residual add.
     attention(il, n, pos);
     lap(2);
     quantize_acts(att_.data(), n, static_cast<int64_t>(H) * D, xq_);
@@ -266,6 +271,7 @@ void Model::forward(const int32_t* tokens, int n, int pos, float* logits, bool a
 #pragma omp parallel for schedule(static) if (n > 1)
     for (int t = 0; t < n; ++t) rmsnorm(h_.data() + t * E, x_.data() + t * E, L.ffn_norm, E, c.rms_eps);
     quantize_acts(h_.data(), n, E, xq_);
+    // SwiGLU FFN: down(silu(gate(h)) * up(h)), residual add.
     matmul(L.w_gate, h_.data(), xq_.data(), n, gate_.data());
     matmul(L.w_up, h_.data(), xq_.data(), n, up_.data());
     lap(4);
@@ -281,6 +287,7 @@ void Model::forward(const int32_t* tokens, int n, int pos, float* logits, bool a
     for (size_t i = 0; i < static_cast<size_t>(n) * E; ++i) x_[i] += h_[i];
   }
 
+  // Final norm and LM head for the last token (or all tokens for perplexity).
   const int first = all_logits ? 0 : n - 1;
   const int m = n - first;
   for (int t = first; t < n; ++t) rmsnorm(h_.data() + (t - first) * E, x_.data() + t * E, output_norm_, E, c.rms_eps);

@@ -26,14 +26,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        language: [c-cpp, actions]
+        include:
+          # C++ needs a traced build: without it the extractor misses httplib.h and nlohmann/json.hpp
+          # (fetched at CMake configure) and the tool status page reports configuration errors.
+          - language: c-cpp
+            build-mode: manual
+          - language: actions
+            build-mode: none
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
           languages: ${{ matrix.language }}
-          build-mode: none
+          build-mode: ${{ matrix.build-mode }}
           queries: security-and-quality
           config: |
             paths:
@@ -41,6 +47,17 @@ jobs:
               - tests
               - tools
               - .github/workflows
+
+      - name: Build (traced by CodeQL)
+        if: matrix.build-mode == 'manual'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends libpcre2-dev ninja-build
+          cmake --version | head -1
+          g++ --version | head -1
+          cmake -B build -G Ninja
+          cmake --build build
 
       - uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:

@@ -113,7 +113,7 @@ static bool check_bf16_helpers() {
   std::vector<uint16_t> kv(n);
   for (int i = 0; i < n; ++i) q[i] = uf(rng), kv[i] = fp32_to_bf16(uf(rng)), y[i] = y0[i] = uf(rng);
   double ref = 0;
-  for (int i = 0; i < n; ++i) ref += q[i] * bf16_to_fp32(kv[i]);
+  for (int i = 0; i < n; ++i) ref += static_cast<double>(q[i]) * bf16_to_fp32(kv[i]);
   bool ok = std::fabs(kern::dot_f32_bf16(q.data(), kv.data(), n) - ref) < 1e-4;
   kern::axpy_bf16(0.5f, kv.data(), y.data(), n);
   for (int i = 0; i < n; ++i) ok &= std::fabs(y[i] - (y0[i] + 0.5f * bf16_to_fp32(kv[i]))) < 1e-6;
@@ -147,7 +147,7 @@ static bool check_gemm(GgmlType t, int64_t k, int rows) {
     for (auto& v : x) v = uf(rng);
     std::vector<BlockQ8> xq;
     quantize_acts(x.data(), n, k, xq);
-    std::vector<float> y0(n * rows), y1(n * rows);
+    std::vector<float> y0(static_cast<size_t>(n) * rows), y1(static_cast<size_t>(n) * rows);
     matmul(w, x.data(), xq.data(), n, y0.data());
     matmul(wp, x.data(), xq.data(), n, y1.data());
     double rms = 0;

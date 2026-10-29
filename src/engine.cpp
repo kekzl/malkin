@@ -389,7 +389,8 @@ double Engine::perplexity_locked(const std::string& text, int window, int* score
   int count = 0;
   const int first = window / 2;
   for (int c = 0; c < n_chunks; ++c) {
-    std::vector<int32_t> chunk(toks.begin() + c * window, toks.begin() + (c + 1) * window);
+    std::vector<int32_t> chunk(toks.begin() + static_cast<ptrdiff_t>(c) * window,
+                               toks.begin() + static_cast<ptrdiff_t>(c + 1) * window);
     if (tok_->add_bos()) chunk[0] = tok_->bos();
     for (int i = 0; i < window; i += Model::kMaxBatch) {
       int n = std::min(Model::kMaxBatch, window - i);
