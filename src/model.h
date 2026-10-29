@@ -59,7 +59,8 @@ class Model {
   void run(const int32_t* tokens, int n, float* logits);
   // Per token: RoPE position, KV row written, first KV row attended, contiguous keys from there.
   std::vector<int> rpos_, kv_at_, kv_base_, n_keys_;
-  std::vector<int> out_;  // tokens whose logits are written
+  std::vector<int> out_;     // tokens whose logits are written
+  std::vector<int> blocks_;  // attention token blocks: start indices, then n
   std::vector<int32_t> ids_;
   struct Layer {
     const float* attn_norm;

@@ -171,20 +171,38 @@ void Model::attention(int il, int n) {
   const size_t kv_row = static_cast<size_t>(KV) * D;
   const size_t layer = static_cast<size_t>(il) * n_seq_ * n_ctx_ * kv_row;
   const float scale = 1.0f / std::sqrt(static_cast<float>(D));
-  // Work items: (token, KV head); the G query heads of a KV head share every K/V row load.
+  // Blocks of up to B consecutive tokens of one sequence (prompt chunks); tree batches stay one token per item.
+  const bool tree = !anc_off_.empty();
+  const int B = tree ? 1 : kern::attend_block_tokens(G);
+  blocks_.clear();
+  for (int t = 0; t < n;) {
+    blocks_.push_back(t);
+    const int t0 = t;
+    for (++t; t < n && t - t0 < B && kv_base_[t] == kv_base_[t0];) ++t;
+  }
+  blocks_.push_back(n);
+  const int nb = static_cast<int>(blocks_.size()) - 1;
+  // Work items: (block, KV head); the G query heads of a KV head share every K/V row load.
 #pragma omp parallel
   {
     thread_local std::vector<float> scratch;
-    if (scratch.size() < static_cast<size_t>(G) * n_ctx_) scratch.resize(static_cast<size_t>(G) * n_ctx_);
+    const size_t need = static_cast<size_t>(B) * G * n_ctx_;
+    if (scratch.size() < need) scratch.resize(need);
 #pragma omp for collapse(2) schedule(dynamic, 1)
-    for (int t = 0; t < n; ++t) {
+    for (int ib = 0; ib < nb; ++ib) {
       for (int g = 0; g < KV; ++g) {
+        const int t = blocks_[ib], bt = blocks_[ib + 1] - t;
         const size_t qoff = (static_cast<size_t>(t) * H + static_cast<size_t>(g) * G) * D;
         const size_t kv = layer + static_cast<size_t>(kv_base_[t]) * kv_row + static_cast<size_t>(g) * D;
-        const bool tree = !anc_off_.empty();
-        kern::attend_gqa(q_.data() + qoff, G, D, kcache_.data() + kv, vcache_.data() + kv, kv_row, n_keys_[t], scale,
-                         att_.data() + qoff, scratch.data(), tree ? anc_.data() + anc_off_[t] : nullptr,
-                         tree ? anc_off_[t + 1] - anc_off_[t] : 0);
+        if (bt > 1) {
+          kern::attend_block(q_.data() + qoff, static_cast<size_t>(H) * D, bt, G, D, kcache_.data() + kv,
+                             vcache_.data() + kv, kv_row, n_keys_.data() + t, scale, att_.data() + qoff,
+                             scratch.data());
+        } else {
+          kern::attend_gqa(q_.data() + qoff, G, D, kcache_.data() + kv, vcache_.data() + kv, kv_row, n_keys_[t], scale,
+                           att_.data() + qoff, scratch.data(), tree ? anc_.data() + anc_off_[t] : nullptr,
+                           tree ? anc_off_[t + 1] - anc_off_[t] : 0);
+        }
       }
     }
   }

@@ -159,6 +159,29 @@ static bool check_attention() {
           }
         }
       }
+  // attend_block vs attend_gqa per token: consecutive and uneven key counts, rows not a multiple of 4.
+  for (int G : {1, 2, 3, 4})
+    for (int D : {64, 128})
+      for (const std::vector<int>& n : std::vector<std::vector<int>>{{5, 6, 7, 8}, {301, 3, 77}, {1, 2}, {9}}) {
+        const int B = static_cast<int>(n.size()), mx = *std::max_element(n.begin(), n.end());
+        const size_t stride = static_cast<size_t>(D) + 16, qs = static_cast<size_t>(G) * D + 32;
+        std::vector<float> q(qs * B), out(q.size()), ref(q.size()), scratch(static_cast<size_t>(B) * G * mx);
+        std::vector<uint16_t> k(stride * mx), v(k.size());
+        for (auto& x : q) x = uf(rng);
+        for (size_t i = 0; i < k.size(); ++i) k[i] = fp32_to_bf16(uf(rng)), v[i] = fp32_to_bf16(uf(rng));
+        const float scale = 1.0f / std::sqrt(static_cast<float>(D));
+        kern::attend_block(q.data(), qs, B, G, D, k.data(), v.data(), stride, n.data(), scale, out.data(),
+                           scratch.data());
+        for (int b = 0; b < B; ++b)
+          kern::attend_gqa(q.data() + b * qs, G, D, k.data(), v.data(), stride, n[b], scale, ref.data() + b * qs,
+                           scratch.data());
+        for (int b = 0; b < B; ++b)
+          for (int i = 0; i < G * D; ++i) {
+            const double err = std::fabs(out[b * qs + i] - ref[b * qs + i]);
+            worst = std::max(worst, err);
+            ok &= err < 1e-5;
+          }
+      }
   std::vector<float> g(37), u(37), g0;
   for (size_t i = 0; i < g.size(); ++i) g[i] = 30.0f * uf(rng), u[i] = uf(rng);
   g[0] = -200.0f;

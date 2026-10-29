@@ -266,4 +266,78 @@ void attend_gqa(const float* q, int G, int D, const uint16_t* k, const uint16_t*
   }
 }
 
+// 4 rows (token x head) per block: one K/V row conversion feeds 4 rows of FMAs.
+int attend_block_tokens(int G) { return std::max(1, 4 / G); }
+
+void attend_block(const float* q, size_t q_stride, int B, int G, int D, const uint16_t* k, const uint16_t* v,
+                  size_t stride, const int* n, float scale, float* out, float* scratch) {
+  const int rows = B * G;
+  constexpr int kMaxRows = 64;
+  if (rows > kMaxRows) {
+    for (int b = 0; b < B; ++b)
+      attend_gqa(q + b * q_stride, G, D, k, v, stride, n[b], scale, out + b * q_stride, scratch);
+    return;
+  }
+  int hi = 0;
+  for (int b = 0; b < B; ++b) hi = std::max(hi, n[b]);
+  const auto off = [&](int r) { return static_cast<size_t>(r / G) * q_stride + static_cast<size_t>(r % G) * D; };
+  const auto keys = [&](int r) { return n[r / G]; };
+  float iv[kMaxRows];
+  for (int r0 = 0; r0 < rows; r0 += 4) {
+    const int rc = std::min(4, rows - r0);
+    // Scores: 4 rows x 4 keys per step (16 accumulators), pairwise adds reduce them to 4 scores per row.
+    const float* qr[4];
+    for (int i = 0; i < 4; ++i) qr[i] = q + off(r0 + std::min(i, rc - 1));
+    int j = 0;
+    for (; j + 4 <= hi; j += 4) {
+      float32x4_t acc[4][4];
+      for (auto& a : acc)
+        for (auto& x : a) x = vdupq_n_f32(0.0f);
+      for (int d = 0; d < D; d += 4) {
+        float32x4_t kf[4];
+        for (int c = 0; c < 4; ++c) kf[c] = bf16x4(k + static_cast<size_t>(j + c) * stride + d);
+        for (int i = 0; i < 4; ++i) {
+          const float32x4_t qv = vld1q_f32(qr[i] + d);
+          for (int c = 0; c < 4; ++c) acc[i][c] = vfmaq_f32(acc[i][c], qv, kf[c]);
+        }
+      }
+      for (int i = 0; i < rc; ++i) {
+        const float32x4_t s = vpaddq_f32(vpaddq_f32(acc[i][0], acc[i][1]), vpaddq_f32(acc[i][2], acc[i][3]));
+        vst1q_f32(scratch + static_cast<size_t>(r0 + i) * hi + j, vmulq_n_f32(s, scale));
+      }
+    }
+    for (; j < hi; ++j)
+      for (int i = 0; i < rc; ++i)
+        scratch[static_cast<size_t>(r0 + i) * hi + j] =
+            dot_f32_bf16(qr[i], k + static_cast<size_t>(j) * stride, D) * scale;
+    int lo = hi;
+    for (int i = 0; i < rc; ++i) {
+      iv[r0 + i] = softmax_inplace(scratch + static_cast<size_t>(r0 + i) * hi, keys(r0 + i));
+      lo = std::min(lo, keys(r0 + i));
+    }
+    // Values: 16 output floats x 4 rows per pass; keys 0..lo-1 shared, each row's own tail after that.
+    const float* p[4];
+    for (int i = 0; i < 4; ++i) p[i] = scratch + static_cast<size_t>(r0 + std::min(i, rc - 1)) * hi;
+    for (int d0 = 0; d0 < D; d0 += 16) {
+      float32x4_t acc[4][4];
+      for (auto& a : acc)
+        for (auto& x : a) x = vdupq_n_f32(0.0f);
+      for (int jj = 0; jj < lo; ++jj) {
+        const uint16_t* vr = v + static_cast<size_t>(jj) * stride + d0;
+        const float32x4_t vf[4] = {bf16x4(vr), bf16x4(vr + 4), bf16x4(vr + 8), bf16x4(vr + 12)};
+        for (int i = 0; i < 4; ++i)
+          for (int c = 0; c < 4; ++c) acc[i][c] = vfmaq_n_f32(acc[i][c], vf[c], p[i][jj]);
+      }
+      for (int i = 0; i < rc; ++i) {
+        for (int jj = lo; jj < keys(r0 + i); ++jj) {
+          const uint16_t* vr = v + static_cast<size_t>(jj) * stride + d0;
+          for (int c = 0; c < 4; ++c) acc[i][c] = vfmaq_n_f32(acc[i][c], bf16x4(vr + 4 * c), p[i][jj]);
+        }
+        float* o = out + off(r0 + i) + d0;
+        for (int c = 0; c < 4; ++c) vst1q_f32(o + 4 * c, vmulq_n_f32(acc[i][c], iv[r0 + i]));
+      }
+    }
+  }
+}
+
 }  // namespace malkin::kern
