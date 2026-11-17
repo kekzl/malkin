@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -270,6 +271,28 @@ void release_pages(const uint8_t* p, size_t n) {
   const size_t head = (4096 - (reinterpret_cast<uintptr_t>(p) & 4095)) & 4095;  // up to the next page start
   if (n < head + 4096) return;
   madvise(const_cast<uint8_t*>(p + head), (n - head) & ~size_t{4095}, MADV_DONTNEED);
+}
+
+void sparse_pages(const uint8_t* p, size_t n) {
+  const size_t head = reinterpret_cast<uintptr_t>(p) & 4095;
+  if (n) madvise(const_cast<uint8_t*>(p - head), n + head, MADV_RANDOM);
+}
+
+LazyU16::~LazyU16() {
+  if (ptr_) munmap(ptr_, n_ * sizeof(uint16_t));
+}
+
+void LazyU16::assign(size_t n) {
+  if (ptr_) munmap(ptr_, n_ * sizeof(uint16_t));
+  ptr_ = nullptr;
+  n_ = 0;
+  if (n == 0) return;
+  void* m = mmap(nullptr, n * sizeof(uint16_t), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (m == MAP_FAILED) throw std::runtime_error("KV cache: mmap failed: " + std::string(std::strerror(errno)));
+  // MALKIN_KV_HUGE: huge pages (one holds 1024 Qwen3-8B KV rows of a layer, resident from its first row on).
+  madvise(m, n * sizeof(uint16_t), std::getenv("MALKIN_KV_HUGE") ? MADV_HUGEPAGE : MADV_NOHUGEPAGE);
+  ptr_ = static_cast<uint16_t*>(m);
+  n_ = n;
 }
 
 const GgufValue* GgufFile::find(const std::string& key) const {

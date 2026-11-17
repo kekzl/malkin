@@ -41,7 +41,7 @@ class Model {
   // the pack itself. The caller checks the RAM first.
   size_t wide_bytes();
   void pack_wide();
-  // First-touch what forward still reads from the mapped file (token embeddings, weights without panels).
+  // First-touch the weights forward reads from the mapped file (those without panels); token embeddings fault lazily.
   void prefetch();
   const ModelConfig& cfg() const { return cfg_; }
   int n_ctx() const { return n_ctx_; }
@@ -88,7 +88,7 @@ class Model {
   const float* output_norm_ = nullptr;
   std::vector<Layer> layers_;
   std::vector<float> inv_freq_;
-  std::vector<uint16_t> kcache_, vcache_;  // [layer][seq * n_ctx + pos][n_head_kv * head_dim], BF16
+  LazyU16 kcache_, vcache_;  // [layer][seq * n_ctx + pos][n_head_kv * head_dim], BF16
 
   // Scratch for up to kMaxBatch tokens.
   std::vector<float> x_, h_, q_, k_, v_, att_, gate_, up_, rope_cos_, rope_sin_;
