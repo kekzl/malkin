@@ -78,19 +78,19 @@ void release_pages(const uint8_t* p, size_t n);
 // Mapped file range read a row here and there (token embeddings): no read-around, only touched pages get resident.
 void sparse_pages(const uint8_t* p, size_t n);
 
-// n zeroed uint16_t in anonymous 4 KiB pages, resident only once written (KV cache: grows with the context used).
-class LazyU16 {
+// n zeroed bytes in anonymous 4 KiB pages, resident only once written (KV cache: grows with the context used).
+class LazyBytes {
  public:
-  LazyU16() = default;
-  LazyU16(const LazyU16&) = delete;
-  LazyU16& operator=(const LazyU16&) = delete;
-  ~LazyU16();
+  LazyBytes() = default;
+  LazyBytes(const LazyBytes&) = delete;
+  LazyBytes& operator=(const LazyBytes&) = delete;
+  ~LazyBytes();
   void assign(size_t n);
-  uint16_t* data() { return ptr_; }
+  int8_t* data() { return ptr_; }
   size_t size() const { return n_; }
 
  private:
-  uint16_t* ptr_ = nullptr;
+  int8_t* ptr_ = nullptr;
   size_t n_ = 0;
 };
 

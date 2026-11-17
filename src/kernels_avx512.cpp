@@ -19,6 +19,11 @@ inline __m512 load_bf16(const uint16_t* p) {
   return _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(ld256(p)), 16));
 }
 
+// 16 int8 KV values as floats (unscaled).
+inline __m512 load_i8(const int8_t* p) {
+  return _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p))));
+}
+
 // Q4_K and Q5_K: unsigned 4/5-bit q per 32-value sub-block, value = d*sc*q - dmin*m.
 template <bool kHigh>
 float dot_qk_45(int64_t k, const uint8_t* w, const BlockQ8* x) {
@@ -165,16 +170,15 @@ float dot_q6_k(int64_t k, const uint8_t* w, const BlockQ8* x) {
   return _mm512_reduce_add_ps(acc) - bias;
 }
 
-float dot_f32_bf16(const float* q, const uint16_t* k, int n) {
+float dot_f32_i8(const float* q, const int8_t* k, int n) {
   __m512 s = _mm512_setzero_ps();
-  for (int d = 0; d < n; d += 16) s = _mm512_fmadd_ps(_mm512_loadu_ps(q + d), load_bf16(k + d), s);
+  for (int d = 0; d < n; d += 16) s = _mm512_fmadd_ps(_mm512_loadu_ps(q + d), load_i8(k + d), s);
   return _mm512_reduce_add_ps(s);
 }
 
-void axpy_bf16(float a, const uint16_t* v, float* y, int n) {
+void axpy_i8(float a, const int8_t* v, float* y, int n) {
   const __m512 av = _mm512_set1_ps(a);
-  for (int d = 0; d < n; d += 16)
-    _mm512_storeu_ps(y + d, _mm512_fmadd_ps(av, load_bf16(v + d), _mm512_loadu_ps(y + d)));
+  for (int d = 0; d < n; d += 16) _mm512_storeu_ps(y + d, _mm512_fmadd_ps(av, load_i8(v + d), _mm512_loadu_ps(y + d)));
 }
 
 namespace {
@@ -222,19 +226,20 @@ float softmax_inplace(float* s, int n) {
 }
 
 template <int DC>
-void attend_t(const float* q, int G, const uint16_t* k, const uint16_t* v, size_t stride, int n0, const int* extra,
-              int ne, float scale, float* out, float* sc) {
+void attend_t(const float* q, int G, const int8_t* k, const int8_t* v, size_t stride, ptrdiff_t soff, int n0,
+              const int* extra, int ne, float scale, float* out, float* sc) {
   constexpr int D = DC * 16;
   constexpr int HP = DC <= 8 ? 2 : 1;  // heads per PV pass: HP x DC accumulators stay in registers
   const int n = n0 + ne;               // keys 0..n0-1, then extra[]
   for (int j = 0; j < n; ++j) {
-    const uint16_t* kr = k + static_cast<size_t>(j < n0 ? j : extra[j - n0]) * stride;
+    const int8_t* kr = k + static_cast<size_t>(j < n0 ? j : extra[j - n0]) * stride;
+    const float ks = kv_scale(kr, soff) * scale;
     __m512 kf[DC];
-    for (int d = 0; d < DC; ++d) kf[d] = load_bf16(kr + 16 * d);
+    for (int d = 0; d < DC; ++d) kf[d] = load_i8(kr + 16 * d);
     for (int h = 0; h < G; ++h) {
       __m512 s = _mm512_mul_ps(_mm512_loadu_ps(q + h * D), kf[0]);
       for (int d = 1; d < DC; ++d) s = _mm512_fmadd_ps(_mm512_loadu_ps(q + h * D + 16 * d), kf[d], s);
-      sc[h * n + j] = _mm512_reduce_add_ps(s) * scale;
+      sc[h * n + j] = _mm512_reduce_add_ps(s) * ks;
     }
   }
   float inv[16];
@@ -245,11 +250,12 @@ void attend_t(const float* q, int G, const uint16_t* k, const uint16_t* v, size_
     for (int hh = 0; hh < HP; ++hh)
       for (int d = 0; d < DC; ++d) acc[hh][d] = _mm512_setzero_ps();
     for (int j = 0; j < n; ++j) {
-      const uint16_t* vr = v + static_cast<size_t>(j < n0 ? j : extra[j - n0]) * stride;
+      const int8_t* vr = v + static_cast<size_t>(j < n0 ? j : extra[j - n0]) * stride;
+      const float vs = kv_scale(vr, soff);
       __m512 pj[HP];
-      for (int hh = 0; hh < HP; ++hh) pj[hh] = _mm512_set1_ps(hh < hp ? sc[(h0 + hh) * n + j] : 0.0f);
+      for (int hh = 0; hh < HP; ++hh) pj[hh] = _mm512_set1_ps(hh < hp ? sc[(h0 + hh) * n + j] * vs : 0.0f);
       for (int d = 0; d < DC; ++d) {
-        const __m512 vf = load_bf16(vr + 16 * d);
+        const __m512 vf = load_i8(vr + 16 * d);
         for (int hh = 0; hh < HP; ++hh) acc[hh][d] = _mm512_fmadd_ps(pj[hh], vf, acc[hh][d]);
       }
     }
@@ -273,16 +279,16 @@ void silu_mul(int64_t n, float* g, const float* u) {
   for (; i < n; ++i) g[i] = g[i] / (1.0f + std::exp(-g[i])) * u[i];
 }
 
-void attend_gqa(const float* q, int G, int D, const uint16_t* k, const uint16_t* v, size_t stride, int n, float scale,
-                float* out, float* scratch, const int* extra, int ne) {
+void attend_gqa(const float* q, int G, int D, const int8_t* k, const int8_t* v, size_t stride, ptrdiff_t soff, int n,
+                float scale, float* out, float* scratch, const int* extra, int ne) {
   if (G <= 16) {
     switch (D) {
       case 64:
-        return attend_t<4>(q, G, k, v, stride, n, extra, ne, scale, out, scratch);
+        return attend_t<4>(q, G, k, v, stride, soff, n, extra, ne, scale, out, scratch);
       case 128:
-        return attend_t<8>(q, G, k, v, stride, n, extra, ne, scale, out, scratch);
+        return attend_t<8>(q, G, k, v, stride, soff, n, extra, ne, scale, out, scratch);
       case 256:
-        return attend_t<16>(q, G, k, v, stride, n, extra, ne, scale, out, scratch);
+        return attend_t<16>(q, G, k, v, stride, soff, n, extra, ne, scale, out, scratch);
       default:
         break;
     }
@@ -291,21 +297,21 @@ void attend_gqa(const float* q, int G, int D, const uint16_t* k, const uint16_t*
   auto key = [&](int j) { return static_cast<size_t>(j < n ? j : extra[j - n]) * stride; };
   for (int h = 0; h < G; ++h) {  // other head sizes: one head at a time
     float* s = scratch + static_cast<size_t>(h) * nk;
-    for (int j = 0; j < nk; ++j) s[j] = dot_f32_bf16(q + h * D, k + key(j), D) * scale;
+    for (int j = 0; j < nk; ++j) s[j] = dot_f32_i8(q + h * D, k + key(j), D) * kv_scale(k + key(j), soff) * scale;
     const float iv = softmax_inplace(s, nk);
     float* o = out + h * D;
     for (int d = 0; d < D; ++d) o[d] = 0.0f;
-    for (int j = 0; j < nk; ++j) axpy_bf16(s[j] * iv, v + key(j), o, D);
+    for (int j = 0; j < nk; ++j) axpy_i8(s[j] * iv * kv_scale(v + key(j), soff), v + key(j), o, D);
   }
 }
 
 // One token per call: attend_t keeps a whole 512-bit key row in registers already.
 int attend_block_tokens(int) { return 1; }
 
-void attend_block(const float* q, size_t q_stride, int B, int G, int D, const uint16_t* k, const uint16_t* v,
-                  size_t stride, const int* n, float scale, float* out, float* scratch) {
+void attend_block(const float* q, size_t q_stride, int B, int G, int D, const int8_t* k, const int8_t* v, size_t stride,
+                  ptrdiff_t soff, const int* n, float scale, float* out, float* scratch) {
   for (int b = 0; b < B; ++b)
-    attend_gqa(q + b * q_stride, G, D, k, v, stride, n[b], scale, out + b * q_stride, scratch);
+    attend_gqa(q + b * q_stride, G, D, k, v, stride, soff, n[b], scale, out + b * q_stride, scratch);
 }
 
 }  // namespace malkin::kern

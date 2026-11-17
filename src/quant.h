@@ -54,6 +54,8 @@ bool weight_type_supported(GgmlType t);
 bool weight_type_quantized(GgmlType t);
 
 void quantize_row_q8(const float* x, BlockQ8* y, int64_t k);
+// KV head row: q[i] = round(x[i] / scale), scale = max|x| / 127 (returned; 0 for an all-zero row).
+float quantize_i8(const float* x, int n, int8_t* q);
 void dequantize_row(GgmlType t, const void* src, float* dst, int64_t k);
 
 // Dot product of one weight row (k elements) with one activation row.

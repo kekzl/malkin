@@ -1,5 +1,6 @@
 #pragma once
 // ISA kernels: one implementation per target (kernels_avx512.cpp, kernels_neon.cpp).
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 
@@ -37,22 +38,28 @@ float dot_q6_k(int64_t k, const uint8_t* w, const BlockQ8* x);
 // SwiGLU gate: g[i] = g[i] / (1 + e^-g[i]) * u[i].
 void silu_mul(int64_t n, float* g, const float* u);
 
-// Attention helpers on BF16 KV rows; n is a multiple of 16.
-float dot_f32_bf16(const float* q, const uint16_t* k, int n);
-void axpy_bf16(float a, const uint16_t* v, float* y, int n);
+// KV rows are int8 with one float scale per head row: value = scale * q, the scale soff bytes after the head's first
+// value (unaligned). Helpers return / take unscaled values; n is a multiple of 16.
+inline float kv_scale(const int8_t* head, ptrdiff_t soff) {
+  float s;
+  std::memcpy(&s, head + soff, sizeof s);
+  return s;
+}
+float dot_f32_i8(const float* q, const int8_t* k, int n);
+void axpy_i8(float a, const int8_t* v, float* y, int n);
 
 // Attention of one query token for the G query heads sharing one KV head (GQA).
-// q: G x D floats; keys/values 0..n-1 at k + j * stride, v + j * stride (BF16), then the positions in extra[0..ne)
+// q: G x D floats; keys/values 0..n-1 at k + j * stride, v + j * stride (bytes), then the positions in extra[0..ne)
 // (tree verification: the ancestors of a draft node); out: G x D.
 // scratch: at least G * (n + ne) floats. D is a multiple of 16.
-void attend_gqa(const float* q, int G, int D, const uint16_t* k, const uint16_t* v, size_t stride, int n, float scale,
-                float* out, float* scratch, const int* extra = nullptr, int ne = 0);
+void attend_gqa(const float* q, int G, int D, const int8_t* k, const int8_t* v, size_t stride, ptrdiff_t soff, int n,
+                float scale, float* out, float* scratch, const int* extra = nullptr, int ne = 0);
 
 // B consecutive query tokens of one sequence (prompt reading), same G heads: token b sees keys 0..n[b]-1.
 // Head h of token b at q + b * q_stride + h * D, out likewise; scratch: at least B * G * max(n) floats.
 // Shares each K/V row conversion across the B * G rows.
-void attend_block(const float* q, size_t q_stride, int B, int G, int D, const uint16_t* k, const uint16_t* v,
-                  size_t stride, const int* n, float scale, float* out, float* scratch);
+void attend_block(const float* q, size_t q_stride, int B, int G, int D, const int8_t* k, const int8_t* v, size_t stride,
+                  ptrdiff_t soff, const int* n, float scale, float* out, float* scratch);
 // Tokens per attend_block call for G heads per KV head; 1 = attend_gqa per token.
 int attend_block_tokens(int G);
 
