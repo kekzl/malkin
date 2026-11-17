@@ -182,17 +182,19 @@ size_t Model::wide_bytes() {
 void Model::pack_wide() { pack(true); }
 
 void Model::prefetch() {
-  prefetch_pages(tok_embd_.data, tok_embd_.row_bytes * static_cast<size_t>(tok_embd_.rows));
+  // Token embeddings: one row per token, faulted on first use (8B Q4_K_M: 338 MiB of the file otherwise).
+  if (output_.packed || output_.data != tok_embd_.data)
+    sparse_pages(tok_embd_.data, tok_embd_.row_bytes * static_cast<size_t>(tok_embd_.rows));
   for (const Weight* w : matmul_weights())
-    if (!w->packed && w->data != tok_embd_.data) prefetch_pages(w->data, w->row_bytes * static_cast<size_t>(w->rows));
+    if (!w->packed) prefetch_pages(w->data, w->row_bytes * static_cast<size_t>(w->rows));
 }
 
 void Model::alloc_kv(int n_ctx) {
   const auto& c = cfg_;
   n_ctx_ = n_ctx;
   const size_t kv_row = static_cast<size_t>(c.n_head_kv) * c.head_dim;
-  kcache_.assign(static_cast<size_t>(c.n_layer) * n_seq_ * n_ctx * kv_row, 0);
-  vcache_.assign(kcache_.size(), 0);
+  kcache_.assign(static_cast<size_t>(c.n_layer) * n_seq_ * n_ctx * kv_row);
+  vcache_.assign(kcache_.size());
 }
 
 void Model::attention(int il, int n) {
@@ -373,8 +375,8 @@ void Model::run(const int32_t* tokens, int n, float* logits) {
         rope(k, t);
       }
       for (size_t i = 0; i < kv_row; ++i) {
-        kcache_[(layer + kv_at_[t]) * kv_row + i] = fp32_to_bf16(k_[t * kv_row + i]);
-        vcache_[(layer + kv_at_[t]) * kv_row + i] = fp32_to_bf16(v_[t * kv_row + i]);
+        kcache_.data()[(layer + kv_at_[t]) * kv_row + i] = fp32_to_bf16(k_[t * kv_row + i]);
+        vcache_.data()[(layer + kv_at_[t]) * kv_row + i] = fp32_to_bf16(v_[t * kv_row + i]);
       }
     }
 

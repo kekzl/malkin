@@ -75,5 +75,23 @@ size_t ggml_row_size(GgmlType t, int64_t n);
 // (they stay in the page cache, unmapped and cheap to reclaim). No-ops on failure.
 void prefetch_pages(const uint8_t* p, size_t n);
 void release_pages(const uint8_t* p, size_t n);
+// Mapped file range read a row here and there (token embeddings): no read-around, only touched pages get resident.
+void sparse_pages(const uint8_t* p, size_t n);
+
+// n zeroed uint16_t in anonymous 4 KiB pages, resident only once written (KV cache: grows with the context used).
+class LazyU16 {
+ public:
+  LazyU16() = default;
+  LazyU16(const LazyU16&) = delete;
+  LazyU16& operator=(const LazyU16&) = delete;
+  ~LazyU16();
+  void assign(size_t n);
+  uint16_t* data() { return ptr_; }
+  size_t size() const { return n_; }
+
+ private:
+  uint16_t* ptr_ = nullptr;
+  size_t n_ = 0;
+};
 
 }  // namespace malkin
