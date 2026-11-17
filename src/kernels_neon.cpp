@@ -12,6 +12,16 @@ namespace {
 
 inline float32x4_t bf16x4(const uint16_t* p) { return vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(p), 16)); }
 
+// 16 int8 KV values as floats (unscaled).
+inline void i8x16(const int8_t* p, float32x4_t f[4]) {
+  const int8x16_t b = vld1q_s8(p);
+  const int16x8_t lo = vmovl_s8(vget_low_s8(b)), hi = vmovl_high_s8(b);
+  f[0] = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo)));
+  f[1] = vcvtq_f32_s32(vmovl_high_s16(lo));
+  f[2] = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi)));
+  f[3] = vcvtq_f32_s32(vmovl_high_s16(hi));
+}
+
 inline int32_t dot32(int8x16_t a0, int8x16_t a1, const int8_t* x) {
   return vaddvq_s32(vdotq_s32(vdotq_s32(vdupq_n_s32(0), a0, vld1q_s8(x)), a1, vld1q_s8(x + 16)));
 }
@@ -165,17 +175,23 @@ float dot_q6_k(int64_t k, const uint8_t* w, const BlockQ8* x) {
   return sum;
 }
 
-float dot_f32_bf16(const float* q, const uint16_t* k, int n) {
+float dot_f32_i8(const float* q, const int8_t* k, int n) {
   float32x4_t a0 = vdupq_n_f32(0), a1 = a0;
-  for (int d = 0; d < n; d += 8) {
-    a0 = vfmaq_f32(a0, vld1q_f32(q + d), bf16x4(k + d));
-    a1 = vfmaq_f32(a1, vld1q_f32(q + d + 4), bf16x4(k + d + 4));
+  for (int d = 0; d < n; d += 16) {
+    float32x4_t kf[4];
+    i8x16(k + d, kf);
+    a0 = vfmaq_f32(vfmaq_f32(a0, vld1q_f32(q + d), kf[0]), vld1q_f32(q + d + 8), kf[2]);
+    a1 = vfmaq_f32(vfmaq_f32(a1, vld1q_f32(q + d + 4), kf[1]), vld1q_f32(q + d + 12), kf[3]);
   }
   return vaddvq_f32(vaddq_f32(a0, a1));
 }
 
-void axpy_bf16(float a, const uint16_t* v, float* y, int n) {
-  for (int d = 0; d < n; d += 4) vst1q_f32(y + d, vfmaq_n_f32(vld1q_f32(y + d), bf16x4(v + d), a));
+void axpy_i8(float a, const int8_t* v, float* y, int n) {
+  for (int d = 0; d < n; d += 16) {
+    float32x4_t vf[4];
+    i8x16(v + d, vf);
+    for (int c = 0; c < 4; ++c) vst1q_f32(y + d + 4 * c, vfmaq_n_f32(vld1q_f32(y + d + 4 * c), vf[c], a));
+  }
 }
 
 }  // namespace malkin::kern
@@ -215,14 +231,19 @@ float softmax_inplace(float* s, int n) {
   return 1.0f / (vaddvq_f32(sum) + tail);
 }
 
-// out[0..4C) = iv * sum_j p[j] * v_j[0..4C): C accumulators stay in registers.
+// out[0..4C) = iv * sum_j p[j] * vs_j * v_j[d0..d0+4C): C accumulators stay in registers; C is 4 or 16.
 template <int C, class Row>
-void pv_pass(const float* p, int n, const uint16_t* v, Row row, float iv, float* out) {
+void pv_pass(const float* p, int n, const int8_t* v, int d0, ptrdiff_t soff, Row row, float iv, float* out) {
   float32x4_t acc[C];
   for (auto& a : acc) a = vdupq_n_f32(0.0f);
   for (int j = 0; j < n; ++j) {
-    const uint16_t* vr = v + row(j);
-    for (int c = 0; c < C; ++c) acc[c] = vfmaq_n_f32(acc[c], bf16x4(vr + 4 * c), p[j]);
+    const int8_t* vr = v + row(j);
+    const float w = p[j] * kv_scale(vr, soff);
+    for (int c = 0; c < C; c += 4) {
+      float32x4_t vf[4];
+      i8x16(vr + d0 + 4 * c, vf);
+      for (int u = 0; u < 4; ++u) acc[c + u] = vfmaq_n_f32(acc[c + u], vf[u], w);
+    }
   }
   for (int c = 0; c < C; ++c) vst1q_f32(out + 4 * c, vmulq_n_f32(acc[c], iv));
 }
@@ -239,20 +260,24 @@ void silu_mul(int64_t n, float* g, const float* u) {
   for (; i < n; ++i) g[i] = g[i] / (1.0f + std::exp(-g[i])) * u[i];
 }
 
-void attend_gqa(const float* q, int G, int D, const uint16_t* k, const uint16_t* v, size_t stride, int n0, float scale,
-                float* out, float* scratch, const int* extra, int ne) {
+void attend_gqa(const float* q, int G, int D, const int8_t* k, const int8_t* v, size_t stride, ptrdiff_t soff, int n0,
+                float scale, float* out, float* scratch, const int* extra, int ne) {
   const int n = n0 + ne;
   auto row = [&](int j) { return static_cast<size_t>(j < n0 ? j : extra[j - n0]) * stride; };
   // Scores: each key row is read once for all G heads.
   for (int j = 0; j < n; ++j) {
-    const uint16_t* kr = k + row(j);
+    const int8_t* kr = k + row(j);
+    const float ks = kv_scale(kr, soff) * scale;
     for (int h = 0; h < G; ++h) {
       const float* qh = q + static_cast<size_t>(h) * D;
       float32x4_t a[4] = {vdupq_n_f32(0.0f), vdupq_n_f32(0.0f), vdupq_n_f32(0.0f), vdupq_n_f32(0.0f)};
-      for (int d = 0; d < D; d += 16)
-        for (int c = 0; c < 4; ++c) a[c] = vfmaq_f32(a[c], vld1q_f32(qh + d + 4 * c), bf16x4(kr + d + 4 * c));
+      for (int d = 0; d < D; d += 16) {
+        float32x4_t kf[4];
+        i8x16(kr + d, kf);
+        for (int c = 0; c < 4; ++c) a[c] = vfmaq_f32(a[c], vld1q_f32(qh + d + 4 * c), kf[c]);
+      }
       scratch[static_cast<size_t>(h) * n + j] =
-          vaddvq_f32(vaddq_f32(vaddq_f32(a[0], a[1]), vaddq_f32(a[2], a[3]))) * scale;
+          vaddvq_f32(vaddq_f32(vaddq_f32(a[0], a[1]), vaddq_f32(a[2], a[3]))) * ks;
     }
   }
   // Values: 64 output floats per pass (16 registers), 16 for the rest of D.
@@ -261,21 +286,21 @@ void attend_gqa(const float* q, int G, int D, const uint16_t* k, const uint16_t*
     const float iv = softmax_inplace(s, n);
     float* o = out + static_cast<size_t>(h) * D;
     int d = 0;
-    for (; d + 64 <= D; d += 64) pv_pass<16>(s, n, v + d, row, iv, o + d);
-    for (; d < D; d += 16) pv_pass<4>(s, n, v + d, row, iv, o + d);
+    for (; d + 64 <= D; d += 64) pv_pass<16>(s, n, v, d, soff, row, iv, o + d);
+    for (; d < D; d += 16) pv_pass<4>(s, n, v, d, soff, row, iv, o + d);
   }
 }
 
 // 4 rows (token x head) per block: one K/V row conversion feeds 4 rows of FMAs.
 int attend_block_tokens(int G) { return std::max(1, 4 / G); }
 
-void attend_block(const float* q, size_t q_stride, int B, int G, int D, const uint16_t* k, const uint16_t* v,
-                  size_t stride, const int* n, float scale, float* out, float* scratch) {
+void attend_block(const float* q, size_t q_stride, int B, int G, int D, const int8_t* k, const int8_t* v, size_t stride,
+                  ptrdiff_t soff, const int* n, float scale, float* out, float* scratch) {
   const int rows = B * G;
   constexpr int kMaxRows = 64;
   if (rows > kMaxRows) {
     for (int b = 0; b < B; ++b)
-      attend_gqa(q + b * q_stride, G, D, k, v, stride, n[b], scale, out + b * q_stride, scratch);
+      attend_gqa(q + b * q_stride, G, D, k, v, stride, soff, n[b], scale, out + b * q_stride, scratch);
     return;
   }
   int hi = 0;
@@ -293,23 +318,27 @@ void attend_block(const float* q, size_t q_stride, int B, int G, int D, const ui
       float32x4_t acc[4][4];
       for (auto& a : acc)
         for (auto& x : a) x = vdupq_n_f32(0.0f);
-      for (int d = 0; d < D; d += 4) {
-        float32x4_t kf[4];
-        for (int c = 0; c < 4; ++c) kf[c] = bf16x4(k + static_cast<size_t>(j + c) * stride + d);
-        for (int i = 0; i < 4; ++i) {
-          const float32x4_t qv = vld1q_f32(qr[i] + d);
-          for (int c = 0; c < 4; ++c) acc[i][c] = vfmaq_f32(acc[i][c], qv, kf[c]);
+      for (int d = 0; d < D; d += 16) {
+        for (int c = 0; c < 4; ++c) {
+          float32x4_t kf[4];
+          i8x16(k + static_cast<size_t>(j + c) * stride + d, kf);
+          for (int i = 0; i < 4; ++i)
+            for (int u = 0; u < 4; ++u) acc[i][c] = vfmaq_f32(acc[i][c], vld1q_f32(qr[i] + d + 4 * u), kf[u]);
         }
       }
+      float ks[4];
+      for (int c = 0; c < 4; ++c) ks[c] = kv_scale(k + static_cast<size_t>(j + c) * stride, soff) * scale;
+      const float32x4_t ksv = vld1q_f32(ks);
       for (int i = 0; i < rc; ++i) {
         const float32x4_t s = vpaddq_f32(vpaddq_f32(acc[i][0], acc[i][1]), vpaddq_f32(acc[i][2], acc[i][3]));
-        vst1q_f32(scratch + static_cast<size_t>(r0 + i) * hi + j, vmulq_n_f32(s, scale));
+        vst1q_f32(scratch + static_cast<size_t>(r0 + i) * hi + j, vmulq_f32(s, ksv));
       }
     }
-    for (; j < hi; ++j)
-      for (int i = 0; i < rc; ++i)
-        scratch[static_cast<size_t>(r0 + i) * hi + j] =
-            dot_f32_bf16(qr[i], k + static_cast<size_t>(j) * stride, D) * scale;
+    for (; j < hi; ++j) {
+      const int8_t* kr = k + static_cast<size_t>(j) * stride;
+      const float ks = kv_scale(kr, soff) * scale;
+      for (int i = 0; i < rc; ++i) scratch[static_cast<size_t>(r0 + i) * hi + j] = dot_f32_i8(qr[i], kr, D) * ks;
+    }
     int lo = hi;
     for (int i = 0; i < rc; ++i) {
       iv[r0 + i] = softmax_inplace(scratch + static_cast<size_t>(r0 + i) * hi, keys(r0 + i));
@@ -323,15 +352,20 @@ void attend_block(const float* q, size_t q_stride, int B, int G, int D, const ui
       for (auto& a : acc)
         for (auto& x : a) x = vdupq_n_f32(0.0f);
       for (int jj = 0; jj < lo; ++jj) {
-        const uint16_t* vr = v + static_cast<size_t>(jj) * stride + d0;
-        const float32x4_t vf[4] = {bf16x4(vr), bf16x4(vr + 4), bf16x4(vr + 8), bf16x4(vr + 12)};
+        const int8_t* vr = v + static_cast<size_t>(jj) * stride;
+        const float vs = kv_scale(vr, soff);
+        float32x4_t vf[4];
+        i8x16(vr + d0, vf);
         for (int i = 0; i < 4; ++i)
-          for (int c = 0; c < 4; ++c) acc[i][c] = vfmaq_n_f32(acc[i][c], vf[c], p[i][jj]);
+          for (int c = 0; c < 4; ++c) acc[i][c] = vfmaq_n_f32(acc[i][c], vf[c], p[i][jj] * vs);
       }
       for (int i = 0; i < rc; ++i) {
         for (int jj = lo; jj < keys(r0 + i); ++jj) {
-          const uint16_t* vr = v + static_cast<size_t>(jj) * stride + d0;
-          for (int c = 0; c < 4; ++c) acc[i][c] = vfmaq_n_f32(acc[i][c], bf16x4(vr + 4 * c), p[i][jj]);
+          const int8_t* vr = v + static_cast<size_t>(jj) * stride;
+          const float w = p[i][jj] * kv_scale(vr, soff);
+          float32x4_t vf[4];
+          i8x16(vr + d0, vf);
+          for (int c = 0; c < 4; ++c) acc[i][c] = vfmaq_n_f32(acc[i][c], vf[c], w);
         }
         float* o = out + off(r0 + i) + d0;
         for (int c = 0; c < 4; ++c) vst1q_f32(o + 4 * c, vmulq_n_f32(acc[i][c], iv[r0 + i]));

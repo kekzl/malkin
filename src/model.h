@@ -16,7 +16,7 @@ struct ModelConfig {
 };
 
 ModelConfig read_config(const GgufFile& f);
-// KV cache bytes per token position (BF16 K and V, all layers).
+// KV cache bytes per token position (int8 K and V with a scale per head, all layers).
 size_t kv_bytes_per_token(const ModelConfig& c);
 
 // One token of a multi-sequence batch. Plain (parent < 0): RoPE position and KV row pos, attends to positions
@@ -29,7 +29,7 @@ struct BatchToken {
   int kv = -1, parent = -1;
 };
 
-// Qwen3 dense decoder over n_seq sequences of n_ctx positions each, BF16 KV cache.
+// Qwen3 dense decoder over n_seq sequences of n_ctx positions each, int8 KV cache.
 class Model {
  public:
   static constexpr int kMaxBatch = 256;
@@ -88,7 +88,7 @@ class Model {
   const float* output_norm_ = nullptr;
   std::vector<Layer> layers_;
   std::vector<float> inv_freq_;
-  LazyU16 kcache_, vcache_;  // [layer][seq * n_ctx + pos][n_head_kv * head_dim], BF16
+  LazyBytes kcache_, vcache_;  // [layer][seq * n_ctx + pos]: n_head_kv x head_dim int8, n_head_kv float scales
 
   // Scratch for up to kMaxBatch tokens.
   std::vector<float> x_, h_, q_, k_, v_, att_, gate_, up_, rope_cos_, rope_sin_;

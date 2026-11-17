@@ -100,9 +100,14 @@ ModelConfig read_config(const GgufFile& f) {
   return c;
 }
 
-size_t kv_bytes_per_token(const ModelConfig& c) {
-  return static_cast<size_t>(c.n_layer) * c.n_head_kv * c.head_dim * 2 * sizeof(uint16_t);
-}
+namespace {
+
+// KV row of one position: n_head_kv x head_dim int8, then one float scale per head.
+size_t kv_row_bytes(const ModelConfig& c) { return static_cast<size_t>(c.n_head_kv) * (c.head_dim + sizeof(float)); }
+
+}  // namespace
+
+size_t kv_bytes_per_token(const ModelConfig& c) { return static_cast<size_t>(c.n_layer) * 2 * kv_row_bytes(c); }
 
 Model::Model(const GgufFile& f, int n_ctx, int n_seq) : cfg_(read_config(f)), n_ctx_(n_ctx), n_seq_(n_seq) {
   const auto& c = cfg_;
@@ -192,15 +197,14 @@ void Model::prefetch() {
 void Model::alloc_kv(int n_ctx) {
   const auto& c = cfg_;
   n_ctx_ = n_ctx;
-  const size_t kv_row = static_cast<size_t>(c.n_head_kv) * c.head_dim;
-  kcache_.assign(static_cast<size_t>(c.n_layer) * n_seq_ * n_ctx * kv_row);
+  kcache_.assign(static_cast<size_t>(c.n_layer) * n_seq_ * n_ctx * kv_row_bytes(c));
   vcache_.assign(kcache_.size());
 }
 
 void Model::attention(int il, int n) {
   const auto& c = cfg_;
   const int D = c.head_dim, H = c.n_head, KV = c.n_head_kv, G = H / KV;
-  const size_t kv_row = static_cast<size_t>(KV) * D;
+  const size_t kv_row = kv_row_bytes(c);
   const size_t layer = static_cast<size_t>(il) * n_seq_ * n_ctx_ * kv_row;
   const float scale = 1.0f / std::sqrt(static_cast<float>(D));
   // Blocks of up to B consecutive tokens of one sequence (prompt chunks); tree batches stay one token per item.
@@ -226,13 +230,15 @@ void Model::attention(int il, int n) {
         const int t = blocks_[ib], bt = blocks_[ib + 1] - t;
         const size_t qoff = (static_cast<size_t>(t) * H + static_cast<size_t>(g) * G) * D;
         const size_t kv = layer + static_cast<size_t>(kv_base_[t]) * kv_row + static_cast<size_t>(g) * D;
+        // Head g: values at g * D, its scale at KV * D + 4 g of the row.
+        const ptrdiff_t soff = static_cast<ptrdiff_t>(KV - g) * D + static_cast<ptrdiff_t>(g * sizeof(float));
         if (bt > 1) {
           kern::attend_block(q_.data() + qoff, static_cast<size_t>(H) * D, bt, G, D, kcache_.data() + kv,
-                             vcache_.data() + kv, kv_row, n_keys_.data() + t, scale, att_.data() + qoff,
+                             vcache_.data() + kv, kv_row, soff, n_keys_.data() + t, scale, att_.data() + qoff,
                              scratch.data());
         } else {
-          kern::attend_gqa(q_.data() + qoff, G, D, kcache_.data() + kv, vcache_.data() + kv, kv_row, n_keys_[t], scale,
-                           att_.data() + qoff, scratch.data(), tree ? anc_.data() + anc_off_[t] : nullptr,
+          kern::attend_gqa(q_.data() + qoff, G, D, kcache_.data() + kv, vcache_.data() + kv, kv_row, soff, n_keys_[t],
+                           scale, att_.data() + qoff, scratch.data(), tree ? anc_.data() + anc_off_[t] : nullptr,
                            tree ? anc_off_[t + 1] - anc_off_[t] : 0);
         }
       }
@@ -374,9 +380,14 @@ void Model::run(const int32_t* tokens, int n, float* logits) {
         rmsnorm(k, k, L.k_norm, D, c.rms_eps);
         rope(k, t);
       }
-      for (size_t i = 0; i < kv_row; ++i) {
-        kcache_.data()[(layer + kv_at_[t]) * kv_row + i] = fp32_to_bf16(k_[t * kv_row + i]);
-        vcache_.data()[(layer + kv_at_[t]) * kv_row + i] = fp32_to_bf16(v_[t * kv_row + i]);
+      const size_t row = (layer + kv_at_[t]) * kv_row_bytes(c);
+      for (int pass = 0; pass < 2; ++pass) {
+        const float* src = (pass ? v_ : k_).data() + t * kv_row;
+        int8_t* dst = (pass ? vcache_ : kcache_).data() + row;
+        for (int h = 0; h < KV; ++h) {
+          const float s = quantize_i8(src + static_cast<size_t>(h) * D, D, dst + static_cast<size_t>(h) * D);
+          std::memcpy(dst + kv_row + h * sizeof(float), &s, sizeof s);
+        }
       }
     }
 
@@ -420,11 +431,11 @@ namespace malkin {
 
 void Model::move_kv(int from, int to, int seq) {
   if (from == to) return;
-  const size_t row = static_cast<size_t>(cfg_.n_head_kv) * cfg_.head_dim;
+  const size_t row = kv_row_bytes(cfg_);
   for (int il = 0; il < cfg_.n_layer; ++il) {
     const size_t base = static_cast<size_t>(il) * n_seq_ * n_ctx_ + static_cast<size_t>(seq) * n_ctx_;
-    std::memcpy(kcache_.data() + (base + to) * row, kcache_.data() + (base + from) * row, row * sizeof(uint16_t));
-    std::memcpy(vcache_.data() + (base + to) * row, vcache_.data() + (base + from) * row, row * sizeof(uint16_t));
+    std::memcpy(kcache_.data() + (base + to) * row, kcache_.data() + (base + from) * row, row);
+    std::memcpy(vcache_.data() + (base + to) * row, vcache_.data() + (base + from) * row, row);
   }
 }
 

@@ -113,10 +113,10 @@ Ampere Altra cloud slice (netcup, 8 GB RAM, a production host). NEON panel GEMM 
 - **Q6_K prompt reading** is 1.44x llama.cpp, not 2x: its scale per 16 weights needs a float multiply per 4 `vpdpbusd` on the same ports (one core: 0.43 TMAC/s, 0.51 in an ablation build without scales).
 - **Answers without a draft model** are level with llama.cpp on the 9800X3D: memory bandwidth, not compute, sets the pace. llama.cpp can run a draft model too; the tables compare both engines on their defaults.
 - **Small VMs.** On the 4-vCPU EPYC VPS answers are 6-35 % slower than llama.cpp: a fixed cost per token (attention 2.73 ms vs 0.36 ms on the 9800X3D) and Q4_K/Q6_K decode kernels below the Q8_0 bandwidth. A 0.6B draft slows a 1.7B target there 2.5x.
-- **RAM.** Packed panels are copies of the weights, so K-quant models take about 3x the GGUF size: Qwen3-1.7B Q4_K_M (1223 MiB file) peaks at 3912 MiB anonymous RSS with ctx 4096, 1788 MiB with `MALKIN_NO_WIDE=1` (slower prompt reading). The auto context fills half of what remains. Wide panels are packed only where they leave room for the KV cache plus 512 MiB, so a small host drops them by itself: Qwen3-8B Q4_K_M (4795 MiB file) under `docker --memory 6g` on 4 cores with `--parallel 2 --ctx 2048` holds 4628 MiB anonymous after the load (4544 MiB panels) and 5204 MiB with both contexts full: the KV cache (576 MiB here) and the token embeddings (338 MiB of the file) get resident only as far as they are used, pp512 163.1-167.4 tok/s, tg64 11.24-11.27 (llama.cpp under the same limits: 81.24 / 11.21); with wide panels (13270 MiB) pp512 is 184.6.
+- **RAM.** Packed panels are copies of the weights, so K-quant models take about 3x the GGUF size: Qwen3-1.7B Q4_K_M (1223 MiB file) peaks at 3912 MiB anonymous RSS with ctx 4096, 1788 MiB with `MALKIN_NO_WIDE=1` (slower prompt reading). The auto context fills half of what remains. Wide panels are packed only where they leave room for the KV cache plus 512 MiB, so a small host drops them by itself: Qwen3-8B Q4_K_M (4795 MiB file) under `docker --memory 6g` on 4 cores with `--parallel 2 --ctx 2048` holds 4628 MiB anonymous after the load (4544 MiB panels) and 4855 MiB with 1600 of the 4096 positions written: the KV cache (int8, 0.29 GiB here) and the token embeddings (338 MiB of the file) get resident only as far as they are used, pp512 163.1-167.4 tok/s, tg64 11.24-11.27 (llama.cpp under the same limits: 81.24 / 11.21); with wide panels (13270 MiB) pp512 is 184.6.
 <!-- [PROV: date=2026-11-17 hw=Ryzen7-9800X3D WSL2 branch=lowmem-8b cmd=`malkin bench --threads 4 --parallel 2 --ctx 2048 -pp 512 -tg 64` in `docker run --memory 6g --memory-swap 6g --cpuset-cpus 0,2,4,6` (wide row: --memory 24g) vs `llama-bench -p 512 -n 64 -t 4 -r 2` (ghcr.io/ggml-org/llama.cpp:full) with the same docker limits; anon / RssFile from cgroup memory.stat and /proc/PID/status of `malkin serve`, page cache evicted before the start; host load 0.7-3.3] -->
 - **One architecture:** Qwen3 dense (`qwen3`). No MoE, no vision, no tool calls yet.
-- **Neoverse** reads prompts within 5 % of llama.cpp (0.6B Q8_0 3.5 % faster) and answers 1.2-1.5x slower on a Neoverse-N1 VPS (table above; malkin tg runs after the 512-token prompt). Attention (f32 from BF16 KV rows) still takes 38 % of prompt reading.
+- **Neoverse** reads prompts within 5 % of llama.cpp (0.6B Q8_0 3.5 % faster) and answers 1.2-1.5x slower on a Neoverse-N1 VPS (table above; malkin tg runs after the 512-token prompt). Attention still took 38 % of prompt reading there (measured with the former BF16 KV cache; the int8 KV cache is not measured on a Neoverse yet).
 
 ## Quick start
 
@@ -163,7 +163,7 @@ Hybrid reasoning models: `<think>` output goes to `reasoning_content` (OpenAI) o
 | Weights | F32, F16, BF16, Q8_0, Q4_K, Q5_K, Q6_K |
 | Tokenizer | byte-level BPE (`gpt2`), pre-tokenizers `qwen2`, `llama-bpe` |
 | Chat format | ChatML (`<|im_start|>`) |
-| KV cache | BF16 |
+| KV cache | int8, one scale per head row (half of BF16) |
 
 ## How it works
 

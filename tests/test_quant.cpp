@@ -107,18 +107,30 @@ static bool check_q8_sums() {
   return true;
 }
 
-static bool check_bf16_helpers() {
+// Random int8 KV rows of stride bytes: D values, then the head scale at D + 4 (unaligned).
+static void fill_kv(std::vector<int8_t>& kv, size_t stride, int D) {
+  std::uniform_int_distribution<int> ui(-127, 127);
+  std::uniform_real_distribution<float> us(0.005f, 0.03f);
+  for (auto& x : kv) x = static_cast<int8_t>(ui(rng));
+  for (size_t r = 0; r + stride <= kv.size(); r += stride) {
+    const float s = us(rng);
+    std::memcpy(kv.data() + r + D + 4, &s, sizeof s);
+  }
+}
+
+static bool check_i8_helpers() {
   std::uniform_real_distribution<float> uf(-1.0f, 1.0f);
   const int n = 128;
   std::vector<float> q(n), y(n), y0(n);
-  std::vector<uint16_t> kv(n);
-  for (int i = 0; i < n; ++i) q[i] = uf(rng), kv[i] = fp32_to_bf16(uf(rng)), y[i] = y0[i] = uf(rng);
+  std::vector<int8_t> kv(n);
+  fill_kv(kv, n, n);
+  for (int i = 0; i < n; ++i) q[i] = uf(rng), y[i] = y0[i] = uf(rng);
   double ref = 0;
-  for (int i = 0; i < n; ++i) ref += static_cast<double>(q[i]) * bf16_to_fp32(kv[i]);
-  bool ok = std::fabs(kern::dot_f32_bf16(q.data(), kv.data(), n) - ref) < 1e-4;
-  kern::axpy_bf16(0.5f, kv.data(), y.data(), n);
-  for (int i = 0; i < n; ++i) ok &= std::fabs(y[i] - (y0[i] + 0.5f * bf16_to_fp32(kv[i]))) < 1e-6;
-  std::printf("bf16 attention helpers %s (%s)\n", ok ? "ok" : "FAIL", kern::isa_name());
+  for (int i = 0; i < n; ++i) ref += static_cast<double>(q[i]) * kv[i];
+  bool ok = std::fabs(kern::dot_f32_i8(q.data(), kv.data(), n) - ref) < 1e-2;
+  kern::axpy_i8(0.5f, kv.data(), y.data(), n);
+  for (int i = 0; i < n; ++i) ok &= std::fabs(y[i] - (y0[i] + 0.5f * kv[i])) < 1e-4;
+  std::printf("int8 attention helpers %s (%s)\n", ok ? "ok" : "FAIL", kern::isa_name());
   return ok;
 }
 
@@ -133,26 +145,29 @@ static bool check_attention() {
         const int ne = n > 1 ? 3 : 0;
         const size_t stride = static_cast<size_t>(D) + 16;
         std::vector<float> q(static_cast<size_t>(G) * D), out(q.size()), scratch(static_cast<size_t>(G) * (n + ne));
-        std::vector<uint16_t> k(stride * (n + 5)), v(k.size());
+        std::vector<int8_t> k(stride * (n + 5)), v(k.size());
+        fill_kv(k, stride, D), fill_kv(v, stride, D);
         for (auto& x : q) x = uf(rng);
-        for (size_t i = 0; i < k.size(); ++i) k[i] = fp32_to_bf16(uf(rng)), v[i] = fp32_to_bf16(uf(rng));
         const int extra[3] = {n + 4, n + 1, n + 2};
         const float scale = 1.0f / std::sqrt(static_cast<float>(D));
-        kern::attend_gqa(q.data(), G, D, k.data(), v.data(), stride, n, scale, out.data(), scratch.data(), extra, ne);
+        kern::attend_gqa(q.data(), G, D, k.data(), v.data(), stride, D + 4, n, scale, out.data(), scratch.data(), extra,
+                         ne);
         for (int h = 0; h < G; ++h) {
           std::vector<double> s(n + ne);
           double mx = -1e300, sum = 0;
           for (int j = 0; j < n + ne; ++j) {
             const size_t r = static_cast<size_t>(j < n ? j : extra[j - n]) * stride;
             double d = 0;
-            for (int i = 0; i < D; ++i) d += static_cast<double>(q[h * D + i]) * bf16_to_fp32(k[r + i]);
-            mx = std::max(mx, s[j] = d * scale);
+            for (int i = 0; i < D; ++i) d += static_cast<double>(q[h * D + i]) * k[r + i];
+            mx = std::max(mx, s[j] = d * kern::kv_scale(k.data() + r, D + 4) * scale);
           }
           for (double& x : s) sum += x = std::exp(x - mx);
           for (int i = 0; i < D; ++i) {
             double o = 0;
-            for (int j = 0; j < n + ne; ++j)
-              o += s[j] / sum * bf16_to_fp32(v[static_cast<size_t>(j < n ? j : extra[j - n]) * stride + i]);
+            for (int j = 0; j < n + ne; ++j) {
+              const size_t r = static_cast<size_t>(j < n ? j : extra[j - n]) * stride;
+              o += s[j] / sum * kern::kv_scale(v.data() + r, D + 4) * v[r + i];
+            }
             const double err = std::fabs(out[h * D + i] - o);
             worst = std::max(worst, err);
             ok &= err < 1e-4;
@@ -166,14 +181,14 @@ static bool check_attention() {
         const int B = static_cast<int>(n.size()), mx = *std::max_element(n.begin(), n.end());
         const size_t stride = static_cast<size_t>(D) + 16, qs = static_cast<size_t>(G) * D + 32;
         std::vector<float> q(qs * B), out(q.size()), ref(q.size()), scratch(static_cast<size_t>(B) * G * mx);
-        std::vector<uint16_t> k(stride * mx), v(k.size());
+        std::vector<int8_t> k(stride * mx), v(k.size());
+        fill_kv(k, stride, D), fill_kv(v, stride, D);
         for (auto& x : q) x = uf(rng);
-        for (size_t i = 0; i < k.size(); ++i) k[i] = fp32_to_bf16(uf(rng)), v[i] = fp32_to_bf16(uf(rng));
         const float scale = 1.0f / std::sqrt(static_cast<float>(D));
-        kern::attend_block(q.data(), qs, B, G, D, k.data(), v.data(), stride, n.data(), scale, out.data(),
+        kern::attend_block(q.data(), qs, B, G, D, k.data(), v.data(), stride, D + 4, n.data(), scale, out.data(),
                            scratch.data());
         for (int b = 0; b < B; ++b)
-          kern::attend_gqa(q.data() + b * qs, G, D, k.data(), v.data(), stride, n[b], scale, ref.data() + b * qs,
+          kern::attend_gqa(q.data() + b * qs, G, D, k.data(), v.data(), stride, D + 4, n[b], scale, ref.data() + b * qs,
                            scratch.data());
         for (int b = 0; b < B; ++b)
           for (int i = 0; i < G * D; ++i) {
@@ -251,7 +266,7 @@ int main() {
     std::printf("skip: CPU lacks %s\n", miss.c_str());
     return 77;
   }
-  bool ok = check_q8_sums() && check_bf16_helpers() && check_attention();
+  bool ok = check_q8_sums() && check_i8_helpers() && check_attention();
   for (auto t :
        {GgmlType::F32, GgmlType::F16, GgmlType::BF16, GgmlType::Q8_0, GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K}) {
     ok &= check(t, 2560);

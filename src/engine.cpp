@@ -166,7 +166,7 @@ Engine::Engine(const EngineOptions& o) {
   model_id_ = std::filesystem::path(o.model_path).stem().string();
   std::fprintf(
       stderr,
-      "malkin: %s | %s | %d layers, %d embd, %d heads (%d kv), vocab %d | ctx %d x %d seq (KV %.2f GiB BF16) | "
+      "malkin: %s | %s | %d layers, %d embd, %d heads (%d kv), vocab %d | ctx %d x %d seq (KV %.2f GiB int8) | "
       "threads %d decode / %d prefill | loaded in %.1f s\n",
       model_id_.c_str(), cfg.arch.c_str(), cfg.n_layer, cfg.n_embd, cfg.n_head, cfg.n_head_kv, cfg.n_vocab, n_ctx,
       n_seq, static_cast<double>(kv_bytes_per_token(cfg)) * n_ctx * n_seq / (1 << 30), threads_, threads_batch_,

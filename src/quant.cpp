@@ -4,6 +4,7 @@
 #include <sys/mman.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <new>
@@ -129,6 +130,14 @@ void dequant_q6_k(const uint8_t* b, float* y, int64_t k) {
 }  // namespace
 
 void quantize_row_q8(const float* x, BlockQ8* y, int64_t k) { kern::quantize_row_q8(x, y, k); }
+
+float quantize_i8(const float* x, int n, int8_t* q) {
+  float amax = 0.0f;
+  for (int i = 0; i < n; ++i) amax = std::max(amax, std::fabs(x[i]));
+  const float d = amax / 127.0f, id = d != 0.0f ? 1.0f / d : 0.0f;
+  for (int i = 0; i < n; ++i) q[i] = static_cast<int8_t>(std::lrintf(x[i] * id));
+  return d;
+}
 
 void dequantize_row(GgmlType t, const void* src, float* dst, int64_t k) {
   auto* b = static_cast<const uint8_t*>(src);
