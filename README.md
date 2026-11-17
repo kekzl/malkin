@@ -107,14 +107,35 @@ Ampere Altra cloud slice (netcup, 8 GB RAM, a production host). NEON panel GEMM 
 
 <!-- [PROV: date=2026-10-29 hw=Neoverse-N1 4 vCPU KVM (netcup ARM, pkranefoer host) row path: image=main 978d083; now: branch attn-block, linux/arm64; kernel rows from the neon-panels build cmd=`malkin bench --ctx 4096 -pp 512 -tg 128` (tg after the prompt) vs `llama-bench -p 512 -n 128 -t 4 -r 1` (ghcr.io/ggml-org/llama.cpp:full-b11960, tg from an empty context), interleaved, best of 3, docker --memory 2500m, host load 3.4 at start, 3.9 at end (the runs themselves); llama.cpp tg ranged 26.26-33.02 between rounds] -->
 
+### An 8B model in 6 GB on 4 cores
+
+Qwen3-8B Q4_K_M (4795 MiB file) under `docker run --memory 6g --cpuset-cpus 0,2,4,6`, default settings apart from the two slots:
+
+```bash
+docker run --rm --memory 6g -p 127.0.0.1:8080:8080 -v /path/to/models:/models:ro \
+  ghcr.io/kekzl/malkin:latest --model /models/Qwen3-8B-Q4_K_M.gguf --parallel 2 --ctx 2048
+```
+
+| 4 threads, 6 GB limit, 9800X3D | malkin | llama.cpp |
+|---|---:|---:|
+| Prompt, pp512 tok/s | **160.7-164.9** | 81.24 |
+| Answer, tg64 tok/s | 11.37-11.54 | 11.21 |
+| Two concurrent requests, aggregate tok/s | 22.50 | - |
+| Anonymous memory after load, MiB | 4628 | - |
+| Anonymous peak, 512-token prompt + 64 tokens, MiB | 4707 | - |
+| KV cache for 2 x 2048 tokens when full, GiB | 0.29 | - |
+
+Where the memory goes: 4544 MiB packed panels (the GGUF pages of packed weights are unmapped again), the KV cache as int8 with one scale per head row (half of BF16) in pages that become resident as the context fills, token embeddings read from the file row by row. Wide prompt panels (another 8061 MiB for this model, pp512 184.6 tok/s with 24 GB) are packed only if the free RAM covers them plus the KV cache plus 512 MiB; 0.1.0 packed them always and was OOM-killed here.
+
+<!-- [PROV: date=2026-11-17 hw=Ryzen7-9800X3D WSL2 image=main df3f64a (wide row: branch lowmem-8b, --memory 24g) cmd=`malkin bench --threads 4 --parallel 2 --ctx 2048 -pp 512 -tg 64` in `docker run --memory 6g --memory-swap 6g --cpuset-cpus 0,2,4,6`, 2 rounds, vs `llama-bench -p 512 -n 64 -t 4 -r 2` (ghcr.io/ggml-org/llama.cpp:full) with the same docker limits; concurrent: `tools/bench_parallel.sh URL 2 128` (branch kv-q8); memory: cgroup memory.stat anon and /proc/PID/smaps of `malkin serve`; host load 0.2-3.3. Not measured on the EPYC or Neoverse VPS] -->
+
 ### Where malkin loses, and what it is not
 
 - **Two ISAs.** No AVX2-only x86, no Apple, no SVE paths yet (Neoverse-V1/V2 run the N1 kernels).
 - **Q6_K prompt reading** is 1.44x llama.cpp, not 2x: its scale per 16 weights needs a float multiply per 4 `vpdpbusd` on the same ports (one core: 0.43 TMAC/s, 0.51 in an ablation build without scales).
 - **Answers without a draft model** are level with llama.cpp on the 9800X3D: memory bandwidth, not compute, sets the pace. llama.cpp can run a draft model too; the tables compare both engines on their defaults.
 - **Small VMs.** On the 4-vCPU EPYC VPS answers are 6-35 % slower than llama.cpp: a fixed cost per token (attention 2.73 ms vs 0.36 ms on the 9800X3D) and Q4_K/Q6_K decode kernels below the Q8_0 bandwidth. A 0.6B draft slows a 1.7B target there 2.5x.
-- **RAM.** Packed panels are copies of the weights, so K-quant models take about 3x the GGUF size: Qwen3-1.7B Q4_K_M (1223 MiB file) peaks at 3912 MiB anonymous RSS with ctx 4096, 1788 MiB with `MALKIN_NO_WIDE=1` (slower prompt reading). The auto context fills half of what remains. Wide panels are packed only where they leave room for the KV cache plus 512 MiB, so a small host drops them by itself: Qwen3-8B Q4_K_M (4795 MiB file) under `docker --memory 6g` on 4 cores with `--parallel 2 --ctx 2048` holds 4628 MiB anonymous after the load (4544 MiB panels) and 4855 MiB with 1600 of the 4096 positions written: the KV cache (int8, 0.29 GiB here) and the token embeddings (338 MiB of the file) get resident only as far as they are used, pp512 163.1-167.4 tok/s, tg64 11.24-11.27 (llama.cpp under the same limits: 81.24 / 11.21); with wide panels (13270 MiB) pp512 is 184.6.
-<!-- [PROV: date=2026-11-17 hw=Ryzen7-9800X3D WSL2 branch=lowmem-8b cmd=`malkin bench --threads 4 --parallel 2 --ctx 2048 -pp 512 -tg 64` in `docker run --memory 6g --memory-swap 6g --cpuset-cpus 0,2,4,6` (wide row: --memory 24g) vs `llama-bench -p 512 -n 64 -t 4 -r 2` (ghcr.io/ggml-org/llama.cpp:full) with the same docker limits; anon / RssFile from cgroup memory.stat and /proc/PID/status of `malkin serve`, page cache evicted before the start; host load 0.7-3.3] -->
+- **RAM.** Packed panels are copies of the weights: a model takes about its GGUF size in anonymous memory, K-quant models about 3x where the host has room for wide panels (Qwen3-1.7B Q4_K_M, 1223 MiB file: 3912 MiB with ctx 4096, 1788 MiB with `MALKIN_NO_WIDE=1`). The auto context fills half of what remains.
 - **One architecture:** Qwen3 dense (`qwen3`). No MoE, no vision, no tool calls yet.
 - **Neoverse** reads prompts within 5 % of llama.cpp (0.6B Q8_0 3.5 % faster) and answers 1.2-1.5x slower on a Neoverse-N1 VPS (table above; malkin tg runs after the 512-token prompt). Attention still took 38 % of prompt reading there (measured with the former BF16 KV cache; the int8 KV cache is not measured on a Neoverse yet).
 
@@ -139,10 +160,10 @@ Release images and tarballs are signed keyless with cosign:
 ```bash
 cosign verify ghcr.io/kekzl/malkin:latest --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   --certificate-identity-regexp '^https://github\.com/kekzl/malkin/\.github/workflows/release\.yml@refs/tags/'
-cosign verify-blob --bundle malkin-0.1.0-linux-x86_64.tar.gz.sigstore.json \
+cosign verify-blob --bundle malkin-0.2.0-linux-x86_64.tar.gz.sigstore.json \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   --certificate-identity-regexp '^https://github\.com/kekzl/malkin/\.github/workflows/release\.yml@refs/tags/' \
-  malkin-0.1.0-linux-x86_64.tar.gz
+  malkin-0.2.0-linux-x86_64.tar.gz
 ```
 
 ## What it serves
@@ -174,7 +195,8 @@ Hybrid reasoning models: `<think>` output goes to `reasoning_content` (OpenAI) o
 | Attention | the query heads of one KV head (GQA) share every K/V row load; vectorized exp |
 | Speculation | greedy: draft top-1 chain + top-2 sibling per depth, verified as a tree (each node attends to the prefix and its ancestors, RoPE at its depth), accepted path compacted in the KV cache; sampling: chain with the exact rejection step |
 | Threads | one engine thread, one OpenMP pool; physical cores for both phases (prefill 348.1 vs 188.7 tok/s on 16 SMT threads, 9800X3D) |
-| NUMA | weights first-touched in parallel at load, so pages spread across EPYC NPS2/NPS4 nodes |
+| Memory | one panel buffer per model, GGUF pages of packed weights unmapped; KV cache int8 with one scale per head row, resident as the context fills; wide panels only where the RAM holds them |
+| NUMA | panels first-touched in parallel while packing, so pages spread across EPYC NPS2/NPS4 nodes |
 
 ## CLI
 
