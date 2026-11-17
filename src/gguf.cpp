@@ -253,14 +253,23 @@ GgufFile::~GgufFile() {
 }
 
 // Parallel first touch: on NUMA hosts (EPYC NPS2/NPS4) page-cache pages land near the threads that read them.
-void GgufFile::prefetch() const {
-  madvise(base_, size_, MADV_WILLNEED);
-  const int64_t pages = static_cast<int64_t>((size_ + 4095) / 4096);
+void prefetch_pages(const uint8_t* p, size_t n) {
+  if (n == 0) return;
+  const size_t head = reinterpret_cast<uintptr_t>(p) & 4095;  // back to the page start
+  const uint8_t* base = p - head;
+  madvise(const_cast<uint8_t*>(base), n + head, MADV_WILLNEED);
+  const int64_t pages = static_cast<int64_t>((n + head + 4095) / 4096);
   unsigned sum = 0;
 #pragma omp parallel for schedule(static) reduction(+ : sum)
-  for (int64_t i = 0; i < pages; ++i) sum += base_[i * 4096];
+  for (int64_t i = 0; i < pages; ++i) sum += base[i * 4096];
   volatile unsigned sink = sum;
   (void)sink;
+}
+
+void release_pages(const uint8_t* p, size_t n) {
+  const size_t head = (4096 - (reinterpret_cast<uintptr_t>(p) & 4095)) & 4095;  // up to the next page start
+  if (n < head + 4096) return;
+  madvise(const_cast<uint8_t*>(p + head), (n - head) & ~size_t{4095}, MADV_DONTNEED);
 }
 
 const GgufValue* GgufFile::find(const std::string& key) const {

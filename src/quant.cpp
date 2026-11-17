@@ -191,24 +191,37 @@ void quantize_acts(const float* x, int n, int64_t k, std::vector<BlockQ8>& out) 
 
 PackedBuffer::~PackedBuffer() { std::free(ptr); }
 
-PackedBuffer pack_weight(Weight& w, bool wide) {
-  PackedBuffer b;
+PackedBuffer::PackedBuffer(size_t bytes) {
+  if (bytes == 0) return;
+  constexpr size_t kHuge = 2u << 20;
+  size = (bytes + kHuge - 1) / kHuge * kHuge;
+  ptr = static_cast<uint8_t*>(std::aligned_alloc(kHuge, size));
+  if (!ptr) throw std::bad_alloc();
+  madvise(ptr, size, MADV_HUGEPAGE);
+}
+
+size_t packed_bytes(const Weight& w, bool wide) {
+  const int R = kern::panel_rows();
+  const size_t bytes = static_cast<size_t>((w.rows + R - 1) / R) * kern::panel_bytes(w.type, w.cols, wide);
+  return (bytes + 63) / 64 * 64;
+}
+
+void pack_weight_into(Weight& w, bool wide, uint8_t* dst) {
   const size_t pb = kern::panel_bytes(w.type, w.cols, wide);
-  if (pb == 0) return b;
   const int R = kern::panel_rows();
   const int64_t panels = (w.rows + R - 1) / R;
-  constexpr size_t kHuge = 2u << 20;
-  b.size = (static_cast<size_t>(panels) * pb + kHuge - 1) / kHuge * kHuge;
-  b.ptr = static_cast<uint8_t*>(std::aligned_alloc(kHuge, b.size));
-  if (!b.ptr) throw std::bad_alloc();
-  madvise(b.ptr, b.size, MADV_HUGEPAGE);
 #pragma omp parallel for schedule(dynamic, 4)
   for (int64_t p = 0; p < panels; ++p) {
     const int rv = static_cast<int>(std::min<int64_t>(R, w.rows - p * R));
-    kern::pack_panel(w.type, wide, w.row(p * R), w.row_bytes, rv, w.cols, b.ptr + p * pb);
+    kern::pack_panel(w.type, wide, w.row(p * R), w.row_bytes, rv, w.cols, dst + p * pb);
   }
-  (wide ? w.wide : w.packed) = b.ptr;
+  (wide ? w.wide : w.packed) = dst;
   (wide ? w.wide_bytes : w.panel_bytes) = pb;
+}
+
+PackedBuffer pack_weight(Weight& w, bool wide) {
+  PackedBuffer b(packed_bytes(w, wide));
+  if (b.ptr) pack_weight_into(w, wide, b.ptr);
   return b;
 }
 

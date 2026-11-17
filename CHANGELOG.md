@@ -10,6 +10,7 @@
 - NEON panel GEMM (Q8_0, Q4_K, Q6_K; `sdot` by lane, 16 rows per panel), vectorized NEON attention, softmax and SiLU. Neoverse-N1 VPS, 4 threads: 0.6B Q8_0 pp512 31.0 -> 158.3 tok/s, tg128 14.48 -> 21.93; 1.7B Q4_K_M pp512 16.7 -> 49.9 (llama.cpp 55.37).
 - `matmul_group`: q/k/v and gate/up in one parallel region (9800X3D 4B Q8_0 tg128 13.14 -> 13.36).
 - Auto context size measures free RAM after the packed weights are resident, counts the draft KV, and honors cgroup v2 limits (`docker --memory`, systemd `MemoryMax`). Before, Qwen3-1.7B Q4_K_M + 0.6B draft under `docker --memory 6g` picked ctx 32768 and was OOM-killed; now ctx 2464.
+- Small hosts: wide prompt panels are packed only where they leave room for the KV cache plus 512 MiB (before: always, Qwen3-8B Q4_K_M under `docker --memory 6g` was OOM-killed at load). All panels of a model share one buffer (8B Q4_K_M: 5398 -> 5204 MiB anonymous without wide panels, 13752 -> 13270 MiB with), packed weights are unmapped from the GGUF (mapped file pages 2931 -> 344 MiB peak) and the load-time prefetch touches only what is still read from the file.
 - `bench_layers`: decode (n = 1) bandwidth over distinct packed weights larger than L3; Q8_0, Q4_K, Q6_K reach 59-61 GB/s on the 9800X3D.
 
 | pp512 tok/s, 9800X3D, 8 threads, best of 3 interleaved, host load 7-9 | 0.1.0 | now | llama.cpp |
