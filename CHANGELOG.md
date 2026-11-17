@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 (2026-11-17)
 
 - Q6_K wide (prefill) kernel: signed weights, activations + 128, the per-row shift preloaded into the integer accumulators, both 16-value halves scaled once per Q8 block.
 - Vectorized SiLU (`kern::silu_mul`), threaded residual adds.
@@ -11,15 +11,22 @@
 - `matmul_group`: q/k/v and gate/up in one parallel region (9800X3D 4B Q8_0 tg128 13.14 -> 13.36).
 - Auto context size measures free RAM after the packed weights are resident, counts the draft KV, and honors cgroup v2 limits (`docker --memory`, systemd `MemoryMax`). Before, Qwen3-1.7B Q4_K_M + 0.6B draft under `docker --memory 6g` picked ctx 32768 and was OOM-killed; now ctx 2464.
 - Small hosts: wide prompt panels are packed only where they leave room for the KV cache plus 512 MiB (before: always, Qwen3-8B Q4_K_M under `docker --memory 6g` was OOM-killed at load). All panels of a model share one buffer (8B Q4_K_M: 5398 -> 5204 MiB anonymous without wide panels, 13752 -> 13270 MiB with), packed weights are unmapped from the GGUF (mapped file pages 2931 -> 344 MiB peak) and the load-time prefetch touches only what is still read from the file.
-- KV cache in lazily faulted 4 KiB pages (`LazyU16`) and token embeddings without load-time prefetch: both get resident only as far as they are used. Qwen3-8B Q4_K_M, `--parallel 2 --ctx 2048`, after the load: 5204 -> 4628 MiB anonymous, 351 -> 13 MiB mapped file; after a 69-token request 4638 MiB. `MALKIN_KV_HUGE=1` puts the KV in huge pages.
+- KV cache in lazily faulted 4 KiB pages (`LazyBytes`) and token embeddings without load-time prefetch: both get resident only as far as they are used. Qwen3-8B Q4_K_M, `--parallel 2 --ctx 2048`, after the load: 5204 -> 4628 MiB anonymous, 351 -> 13 MiB mapped file; after a 69-token request 4638 MiB. `MALKIN_KV_HUGE=1` puts the KV in huge pages.
 - KV cache in int8 with one float scale per head row instead of BF16: half the bytes (Qwen3-8B: 1056 instead of 2048 bytes per K or V row, 2 x 2048 ctx 0.29 instead of 0.56 GiB). 8B Q4_K_M: PPL 17.0506 (BF16 17.0812, llama.cpp 17.1490), pp1536 148.0 / 150.8 vs 149.8 / 151.2 tok/s, tg64 11.22 / 11.06 vs 10.80 / 10.74, anonymous peak after 1600 tokens 4855 vs 5069 MiB.
 - `bench_layers`: decode (n = 1) bandwidth over distinct packed weights larger than L3; Q8_0, Q4_K, Q6_K reach 59-61 GB/s on the 9800X3D.
 
-| pp512 tok/s, 9800X3D, 8 threads, best of 3 interleaved, host load 7-9 | 0.1.0 | now | llama.cpp |
+| pp512 tok/s, 9800X3D, 8 threads, best of 3 interleaved, host load 7-9 | 0.1.0 | 0.2.0 | llama.cpp |
 |---|---:|---:|---:|
 | Qwen3-14B Q6_K | 145.60 | 167.40 | 116.31 |
 | Qwen3-4B Q4_K_M | 493.00 | 513.50 | 241.07 |
 | Qwen3-4B Q8_0 | 476.80 | 506.70 | 116.83 |
+
+Not measured on hardware: the int8 KV cache and the small-host changes on the EPYC 9634 and Neoverse-N1 VPS (9800X3D and qemu only).
+
+| | |
+|---|---|
+| Image | `ghcr.io/kekzl/malkin:0.2.0`, `linux/amd64` + `linux/arm64`, SBOM, provenance, cosign signature |
+| Binaries | `malkin-0.2.0-linux-{x86_64,aarch64}.tar.gz`, libc++ and libomp bundled, glibc 2.38+, cosign bundles |
 
 ## 0.1.0 (2026-10-29)
 
