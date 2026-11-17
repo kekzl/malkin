@@ -19,10 +19,24 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       # arm64: cross-compiled, tests under qemu -cpu neoverse-n1. amd64: tests skip (exit 77) without AVX-512 BF16.
+      # GHA layer cache: the deps stage (apt.llvm.org) is fetched once per deps.sh change, not in every job.
       - name: kernel tests
-        run: docker buildx build --platform ${{ matrix.platform }} --target test --progress plain .
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: test
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
       - name: runtime image
-        run: docker buildx build --platform ${{ matrix.platform }} --target runtime .
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: runtime
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          cache-from: type=gha,scope=${{ matrix.platform }}
 
   lint:
     runs-on: ubuntu-26.04
@@ -33,6 +47,13 @@ jobs:
         run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 -color
       # clang-format, clang-tidy (bugprone, performance; warnings are errors), shellcheck
       - name: deps image
-        run: docker buildx build --target deps --load -t malkin-dev:ci .
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: deps
+          load: true
+          tags: malkin-dev:ci
+          provenance: false
+          cache-from: type=gha,scope=linux/amd64
       - name: lint
         run: docker run --rm -v "$PWD:/src" -w /src malkin-dev:ci tools/lint.sh
