@@ -93,6 +93,14 @@ class Engine {
   // One forward pass over all busy slots: per decoding slot its token plus the draft's proposal (greedy: chain and
   // runner-up tree; sampled: chain), then prompt chunks, up to kMaxBatch tokens. Accepts per slot.
   void step();
+  struct Proposal;
+  // step, in order: props_ with the draft length per decoding slot (true = some slot drafts), the target batch
+  // (returns its decode rows), and per decoding slot the accepted path plus the next token.
+  bool plan_drafts();
+  int build_batch();
+  void accept(const Proposal& pr);
+  bool accept_greedy(const Proposal& pr, Slot& s, int P);  // P: KV row of the slot's next token
+  bool accept_sampled(const Proposal& pr, Slot& s);
   // Draft proposals for every decoding slot with kk > 0, batched across slots (draft sequence = slot).
   void propose();
   void finish(Slot& s);
@@ -122,6 +130,7 @@ class Engine {
     std::vector<Dist> qd;  // sampled: draft distribution of each chain token
   };
   std::vector<Proposal> props_;
+  Dist dist_;  // target distribution scratch of accept_*
   std::vector<float> logits_;
   std::unique_ptr<GgufFile> dfile_;
   std::unique_ptr<Model> draft_;
