@@ -333,14 +333,13 @@ void Engine::propose() {
   }
 }
 
-void Engine::step() {
-  const int n_ctx = model_->n_ctx(), n_vocab = model_->cfg().n_vocab;
-  const int n_slots = static_cast<int>(slots_.size());
+bool Engine::plan_drafts() {
+  const int n_ctx = model_->n_ctx();
   props_.clear();
-  for (int i = 0; i < n_slots; ++i) {
+  for (size_t i = 0; i < slots_.size(); ++i) {
     if (!slots_[i].req || !slots_[i].req->decoding) continue;
     props_.emplace_back();
-    props_.back().seq = i;
+    props_.back().seq = static_cast<int>(i);
   }
   const int nd = static_cast<int>(props_.size());
   // Draft length per decoding slot: adaptive k, within budget and context; all trees fit one target pass.
@@ -355,13 +354,12 @@ void Engine::step() {
     p.kk = std::max(0, std::min({q.k, left, p.greedy ? free / 2 : free, p.greedy ? cap / 2 : cap}));
     drafting = drafting || p.kk > 0;
   }
-  if (drafting) {
-    omp_set_num_threads(threads_);
-    propose();
-  }
+  return drafting;
+}
 
-  // Target batch. Greedy layout per slot: [next, chain0, alt0, chain1, alt1, ...] at KV rows P, P + 1, ...;
-  // chain i and alt i sit at RoPE position P + 1 + i under chain i - 1. Sampled: [next, d0, d1, ...] in a row.
+// Greedy layout per slot: [next, chain0, alt0, chain1, alt1, ...] at KV rows P, P + 1, ...; chain i and alt i sit at
+// RoPE position P + 1 + i under chain i - 1. Sampled: [next, d0, d1, ...] in a row.
+int Engine::build_batch() {
   batch_.clear();
   batch_seq_.clear();
   for (Proposal& p : props_) {
@@ -380,7 +378,7 @@ void Engine::step() {
     }
   }
   const int decode_rows = static_cast<int>(batch_.size());
-  for (int i = 0; i < n_slots; ++i) {  // then prompt chunks in slot order, up to kMaxBatch tokens
+  for (size_t i = 0; i < slots_.size(); ++i) {  // then prompt chunks in slot order, up to kMaxBatch tokens
     const Slot& s = slots_[i];
     if (!s.req || s.req->decoding) continue;
     const auto& prompt = s.req->req.prompt;
@@ -389,12 +387,21 @@ void Engine::step() {
         std::min(Model::kMaxBatch - static_cast<int>(batch_.size()), static_cast<int>(prompt.size()) - from);
     for (int pos = from; pos < from + take; ++pos) {
       const bool last = pos + 1 == static_cast<int>(prompt.size());
-      batch_.push_back({prompt[pos], i, pos, last});
-      if (last) batch_seq_.push_back(i);
+      batch_.push_back({prompt[pos], static_cast<int>(i), pos, last});
+      if (last) batch_seq_.push_back(static_cast<int>(i));
     }
   }
-  const int n = static_cast<int>(batch_.size());
+  return decode_rows;
+}
+
+void Engine::step() {
+  if (plan_drafts()) {
+    omp_set_num_threads(threads_);
+    propose();
+  }
+  const int decode_rows = build_batch(), n = static_cast<int>(batch_.size());
   if (n == 0) return;
+  const int n_ctx = model_->n_ctx(), n_vocab = model_->cfg().n_vocab;
   omp_set_num_threads(n > 16 ? threads_batch_ : threads_);
   model_->forward(batch_.data(), n, logits_.data());
   for (int t = decode_rows; t < n; ++t) slots_[batch_[t].seq].cache.push_back(batch_[t].id);
@@ -409,81 +416,94 @@ void Engine::step() {
     q.next = q.sampler.sample(logits_.data() + (decode_rows + j) * n_vocab, n_vocab);
     if (!q.emit(q.next, *tok_, s.cache.size(), n_ctx)) finish(s);
   }
-
   // Decoding slots: accept the longest verified path, then the next token.
-  Dist p;
-  for (const Proposal& pr : props_) {
-    Slot& s = slots_[pr.seq];
-    Request& q = *s.req;
-    auto& cache = s.cache;
-    const int P = static_cast<int>(cache.size());
-    auto row = [&](int t) { return logits_.data() + static_cast<size_t>(pr.root + t) * n_vocab; };
-    auto emit = [&](int32_t id) { return q.emit(id, *tok_, cache.size(), n_ctx); };
-    cache.push_back(q.next);
-    q.r.drafted += pr.kk;
-    bool go = true;
-    if (pr.kk == 0) {
-      q.next = q.sampler.sample(row(0), n_vocab);
-    } else if (pr.greedy) {
-      int cur = 0, i = 0;
-      bool bonus_ready = false;
-      for (; i < pr.kk; ++i) {
-        q.sampler.distribution(row(cur), n_vocab, p);
-        const int32_t a = p[0].second;
-        int slot = -1;
-        if (a == pr.chain[i])
-          slot = 1 + 2 * i;
-        else if (a == pr.alt[i])
-          slot = 2 + 2 * i;
-        if (slot < 0) {
-          q.next = a;
-          bonus_ready = true;
-          break;
-        }
-        model_->move_kv(P + slot, static_cast<int>(cache.size()), pr.seq);
-        cache.push_back(a);
-        ++q.r.accepted;
-        cur = slot;
-        go = emit(a);
-        if (!go) break;
-        if (slot == 2 + 2 * i) {  // alternative leaf: nothing below it
-          ++i;
-          break;
-        }
-      }
-      if (go && !bonus_ready) {
-        q.sampler.distribution(row(cur), n_vocab, p);
-        q.next = p[0].second;
-      }
-      if (i == pr.kk && pr.kk == q.k && cur == 2 * pr.kk - 1)
-        q.k = std::min(q.k + 1, n_draft_);
-      else if (2 * i < pr.kk)
-        q.k = std::max(1, q.k - 1);
-    } else {
-      int i = 0;
-      for (; i < pr.kk; ++i) {
-        q.sampler.distribution(row(i), n_vocab, p);
-        bool ok = false;
-        const int32_t t = q.sampler.verify(p, pr.qd[i], pr.chain[i], ok);
-        if (!ok) {
-          q.next = t;
-          break;
-        }
-        ++q.r.accepted;
-        cache.push_back(t);
-        go = emit(t);
-        if (!go) break;
-      }
-      if (go && i == pr.kk) q.next = q.sampler.sample(row(pr.kk), n_vocab);
-      // Adapt the draft length: grow after a fully accepted step, shrink when most drafts fail.
-      if (i == pr.kk && pr.kk == q.k)
-        q.k = std::min(q.k + 1, n_draft_);
-      else if (2 * i < pr.kk)
-        q.k = std::max(1, q.k - 1);
-    }
-    if (go) go = emit(q.next);
-    if (!go) finish(s);
+  for (const Proposal& pr : props_) accept(pr);
+}
+
+void Engine::accept(const Proposal& pr) {
+  Slot& s = slots_[pr.seq];
+  Request& q = *s.req;
+  const int n_vocab = model_->cfg().n_vocab;
+  const int P = static_cast<int>(s.cache.size());
+  s.cache.push_back(q.next);
+  q.r.drafted += pr.kk;
+  bool go = true;
+  if (pr.kk == 0) {
+    q.next = q.sampler.sample(logits_.data() + static_cast<size_t>(pr.root) * n_vocab, n_vocab);
+  } else {
+    go = pr.greedy ? accept_greedy(pr, s, P) : accept_sampled(pr, s);
   }
+  if (go) go = q.emit(q.next, *tok_, s.cache.size(), model_->n_ctx());
+  if (!go) finish(s);
+}
+
+// Walks the chain / runner-up tree along the target's argmax. False: the request ended on an accepted token.
+bool Engine::accept_greedy(const Proposal& pr, Slot& s, int P) {
+  Request& q = *s.req;
+  const int n_ctx = model_->n_ctx(), n_vocab = model_->cfg().n_vocab;
+  auto row = [&](int t) { return logits_.data() + static_cast<size_t>(pr.root + t) * n_vocab; };
+  int cur = 0, done = 0;  // tree node reached, draft positions settled
+  bool go = true, bonus_ready = false;
+  for (int i = 0; i < pr.kk; ++i) {
+    q.sampler.distribution(row(cur), n_vocab, dist_);
+    const int32_t a = dist_[0].second;
+    int slot = -1;
+    if (a == pr.chain[i])
+      slot = 1 + 2 * i;
+    else if (a == pr.alt[i])
+      slot = 2 + 2 * i;
+    if (slot < 0) {
+      q.next = a;
+      bonus_ready = true;
+      break;
+    }
+    model_->move_kv(P + slot, static_cast<int>(s.cache.size()), pr.seq);
+    s.cache.push_back(a);
+    ++q.r.accepted;
+    cur = slot;
+    go = q.emit(a, *tok_, s.cache.size(), n_ctx);
+    if (!go) break;
+    done = i + 1;
+    if (slot == 2 + 2 * i) break;  // alternative leaf: nothing below it
+  }
+  if (go && !bonus_ready) {
+    q.sampler.distribution(row(cur), n_vocab, dist_);
+    q.next = dist_[0].second;
+  }
+  // Adapt the draft length: grow after a fully accepted chain, shrink when most drafts fail.
+  if (done == pr.kk && pr.kk == q.k && cur == 2 * pr.kk - 1)
+    q.k = std::min(q.k + 1, n_draft_);
+  else if (2 * done < pr.kk)
+    q.k = std::max(1, q.k - 1);
+  return go;
+}
+
+// Verifies the sampled chain token by token. False: the request ended on an accepted token.
+bool Engine::accept_sampled(const Proposal& pr, Slot& s) {
+  Request& q = *s.req;
+  const int n_ctx = model_->n_ctx(), n_vocab = model_->cfg().n_vocab;
+  auto row = [&](int t) { return logits_.data() + static_cast<size_t>(pr.root + t) * n_vocab; };
+  int i = 0;
+  bool go = true;
+  for (; i < pr.kk; ++i) {
+    q.sampler.distribution(row(i), n_vocab, dist_);
+    bool ok = false;
+    const int32_t t = q.sampler.verify(dist_, pr.qd[i], pr.chain[i], ok);
+    if (!ok) {
+      q.next = t;
+      break;
+    }
+    ++q.r.accepted;
+    s.cache.push_back(t);
+    go = q.emit(t, *tok_, s.cache.size(), n_ctx);
+    if (!go) break;
+  }
+  if (go && i == pr.kk) q.next = q.sampler.sample(row(pr.kk), n_vocab);
+  if (i == pr.kk && pr.kk == q.k)
+    q.k = std::min(q.k + 1, n_draft_);
+  else if (2 * i < pr.kk)
+    q.k = std::max(1, q.k - 1);
+  return go;
 }
 
 void Engine::finish(Slot& s) {
