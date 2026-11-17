@@ -37,6 +37,12 @@ class Model {
   // n_ctx 0: weights only; alloc_kv before the first forward.
   Model(const GgufFile& f, int n_ctx, int n_seq = 1);
   void alloc_kv(int n_ctx);
+  // Wide prefill panels: anonymous bytes they take (0 = none for this ISA / these types, or MALKIN_NO_WIDE), and
+  // the pack itself. The caller checks the RAM first.
+  size_t wide_bytes();
+  void pack_wide();
+  // First-touch what forward still reads from the mapped file (token embeddings, weights without panels).
+  void prefetch();
   const ModelConfig& cfg() const { return cfg_; }
   int n_ctx() const { return n_ctx_; }
   int n_seq() const { return n_seq_; }
@@ -71,6 +77,9 @@ class Model {
   };
 
   void attention(int il, int n);
+  std::vector<Weight*> matmul_weights();
+  // Packs all matmul weights into one buffer, then unmaps their file pages.
+  void pack(bool wide);
   std::vector<int> depth_, anc_, anc_off_;  // tree mode: per-token depth, flattened ancestor KV rows
 
   ModelConfig cfg_;
@@ -84,7 +93,7 @@ class Model {
   // Scratch for up to kMaxBatch tokens.
   std::vector<float> x_, h_, q_, k_, v_, att_, gate_, up_, rope_cos_, rope_sin_;
   std::vector<BlockQ8> xq_;
-  std::vector<PackedBuffer> packs_;  // panel copies of the matmul weights
+  std::vector<PackedBuffer> packs_;  // panel copies of the matmul weights: compact, then wide
 };
 
 }  // namespace malkin

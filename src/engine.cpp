@@ -127,6 +127,22 @@ Engine::Engine(const EngineOptions& o) {
     std::fprintf(stderr, "malkin: draft %s, %d layers, up to %d tokens per step\n",
                  std::filesystem::path(o.draft_path).stem().c_str(), draft_->cfg().n_layer, n_draft_);
   }
+  // Wide prefill panels (about 2x a Q4_K_M file on top of the compact ones) only where they leave room for the KV
+  // (--ctx, or 4096 tokens per sequence when auto) plus 512 MiB; 8B Q4_K_M in 6 GB: 7.4 GiB wide, not packed.
+  {
+    const size_t per_token = kv_bytes_per_token(cfg) + (draft_ ? kv_bytes_per_token(draft_->cfg()) : 0);
+    const size_t keep = per_token * n_seq * std::min(o.n_ctx > 0 ? o.n_ctx : 4096, cfg.n_ctx_train) + (512u << 20);
+    for (Model* m : {model_.get(), draft_.get()}) {
+      const size_t need = m ? m->wide_bytes() : 0, avail = mem_available_bytes();
+      if (need == 0) continue;
+      if (avail >= need + keep) {
+        m->pack_wide();
+      } else {
+        std::fprintf(stderr, "malkin: no wide prompt panels (%zu MiB, %zu MiB available, %zu MiB kept for KV)\n",
+                     need >> 20, avail >> 20, keep >> 20);
+      }
+    }
+  }
   int n_ctx = o.n_ctx > 0 ? o.n_ctx : std::min(cfg.n_ctx_train, 32768);
   if (o.n_ctx <= 0) {
     // Auto: KV (target + draft, all sequences) may take half of the RAM left once the packed weights are resident
@@ -144,7 +160,8 @@ Engine::Engine(const EngineOptions& o) {
   worker_ = std::thread([this] { worker_loop(); });
   on_worker([this] {
     omp_set_num_threads(threads_batch_);
-    file_->prefetch();
+    model_->prefetch();
+    if (draft_) draft_->prefetch();
   });
   model_id_ = std::filesystem::path(o.model_path).stem().string();
   std::fprintf(

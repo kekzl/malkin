@@ -30,15 +30,21 @@ struct Weight {
   explicit operator bool() const { return data != nullptr; }
 };
 
-// Packs w into panels; the buffer is 2 MiB aligned for huge pages. Empty if the ISA has no panel kernel for w.type.
+// Panel storage, 2 MiB aligned for huge pages.
 struct PackedBuffer {
   uint8_t* ptr = nullptr;
   size_t size = 0;
   PackedBuffer() = default;
+  explicit PackedBuffer(size_t bytes);
   PackedBuffer(PackedBuffer&& o) noexcept : ptr(o.ptr), size(o.size) { o.ptr = nullptr; }
   PackedBuffer& operator=(PackedBuffer&&) = delete;
   ~PackedBuffer();
 };
+// Panel bytes of w, rounded up to 64; 0 = the ISA has no such panel kernel for w.type.
+size_t packed_bytes(const Weight& w, bool wide);
+// Packs w into dst (packed_bytes(w, wide) bytes, 64-byte aligned) and points w.packed / w.wide at it.
+void pack_weight_into(Weight& w, bool wide, uint8_t* dst);
+// One weight in a buffer of its own (tests, benches); the model packs all weights into one buffer.
 PackedBuffer pack_weight(Weight& w, bool wide = false);
 // Token count above which matmul prefers wide panels.
 inline constexpr int kWideMinTokens = 16;

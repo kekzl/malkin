@@ -59,8 +59,6 @@ class GgufFile {
   const GgufTensor* tensor(const std::string& name) const;
   const std::map<std::string, GgufTensor>& tensors() const { return tensors_; }
   size_t file_size() const { return size_; }
-  // Fault weights into RAM and advise the kernel to keep them (no-op on failure).
-  void prefetch() const;
 
  private:
   int fd_ = -1;
@@ -72,5 +70,10 @@ class GgufFile {
 
 // Bytes for n elements of type t (n must be a multiple of the block size).
 size_t ggml_row_size(GgmlType t, int64_t n);
+
+// Mapped file range [p, p + n): fault it in with parallel first touch (NUMA spread), or unmap its whole pages
+// (they stay in the page cache, unmapped and cheap to reclaim). No-ops on failure.
+void prefetch_pages(const uint8_t* p, size_t n);
+void release_pages(const uint8_t* p, size_t n);
 
 }  // namespace malkin

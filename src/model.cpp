@@ -128,18 +128,7 @@ Model::Model(const GgufFile& f, int n_ctx, int n_seq) : cfg_(read_config(f)), n_
     l.w_down = weight(f, p + "ffn_down.weight");
     layers_.push_back(l);
   }
-  // MALKIN_NO_PACK: row path only. MALKIN_NO_WIDE: no wide prefill panels (saves ~1 byte per K-quant weight).
-  if (!std::getenv("MALKIN_NO_PACK")) {
-    const bool wide = !std::getenv("MALKIN_NO_WIDE");
-    for (auto& l : layers_) {
-      for (Weight* w : {&l.wq, &l.wk, &l.wv, &l.wo, &l.w_gate, &l.w_up, &l.w_down}) {
-        packs_.push_back(pack_weight(*w));
-        if (wide) packs_.push_back(pack_weight(*w, true));
-      }
-    }
-    packs_.push_back(pack_weight(output_));
-    if (wide) packs_.push_back(pack_weight(output_, true));
-  }
+  if (!std::getenv("MALKIN_NO_PACK")) pack(false);  // MALKIN_NO_PACK: row path only
   for (int i = 0; i < c.head_dim / 2; ++i) inv_freq_.push_back(std::pow(c.rope_base, -2.0f * i / c.head_dim));
 
   if (n_ctx > 0) alloc_kv(n_ctx);
@@ -155,6 +144,47 @@ Model::Model(const GgufFile& f, int n_ctx, int n_seq) : cfg_(read_config(f)), n_
   up_.resize(B * c.n_ff);
   rope_cos_.resize(B * c.head_dim / 2);
   rope_sin_.resize(rope_cos_.size());
+}
+
+std::vector<Weight*> Model::matmul_weights() {
+  std::vector<Weight*> ws;
+  for (auto& l : layers_)
+    for (Weight* w : {&l.wq, &l.wk, &l.wv, &l.wo, &l.w_gate, &l.w_up, &l.w_down}) ws.push_back(w);
+  ws.push_back(&output_);
+  return ws;
+}
+
+// One buffer for all weights: a 2 MiB-aligned buffer each left 5.6 MiB per 8B layer in huge-page tails.
+void Model::pack(bool wide) {
+  const auto ws = matmul_weights();
+  size_t total = 0;
+  for (const Weight* w : ws) total += packed_bytes(*w, wide);
+  if (total == 0) return;
+  packs_.emplace_back(total);
+  uint8_t* dst = packs_.back().ptr;
+  for (Weight* w : ws) {
+    const size_t n = packed_bytes(*w, wide);
+    if (n == 0) continue;
+    pack_weight_into(*w, wide, dst);
+    dst += n;
+    // The rows are not read again once compact panels exist; tied embeddings still are (token lookup).
+    if (w->packed && w->data != tok_embd_.data) release_pages(w->data, w->row_bytes * static_cast<size_t>(w->rows));
+  }
+}
+
+size_t Model::wide_bytes() {
+  if (std::getenv("MALKIN_NO_PACK") || std::getenv("MALKIN_NO_WIDE")) return 0;
+  size_t total = 0;
+  for (const Weight* w : matmul_weights()) total += packed_bytes(*w, true);
+  return total;
+}
+
+void Model::pack_wide() { pack(true); }
+
+void Model::prefetch() {
+  prefetch_pages(tok_embd_.data, tok_embd_.row_bytes * static_cast<size_t>(tok_embd_.rows));
+  for (const Weight* w : matmul_weights())
+    if (!w->packed && w->data != tok_embd_.data) prefetch_pages(w->data, w->row_bytes * static_cast<size_t>(w->rows));
 }
 
 void Model::alloc_kv(int n_ctx) {
