@@ -56,6 +56,16 @@ class Engine {
   // Mean negative log-likelihood per token over text, in windows of n_ctx tokens (second half scored).
   double perplexity(const std::string& text, int window, int* scored);
 
+  struct Probe {
+    std::vector<float> hidden;  // final-norm state of the last token (n_embd)
+    std::vector<float> logits;  // logits of the requested ids after the last token
+    int tokens = 0, cached = 0;
+    double ms = 0;
+  };
+  // Evaluates tokens in sequence 0 between generations, reusing the KV of the prefix shared with the previous
+  // use of that sequence. Embeddings read hidden, rerank reads the logits of its two answer tokens.
+  Probe probe(const std::vector<int32_t>& tokens, const std::vector<int32_t>& ids);
+
   const Tokenizer& tokenizer() const { return *tok_; }
   const ChatFormat& chat() const { return *chat_; }
   const ModelConfig& cfg() const { return model_->cfg(); }

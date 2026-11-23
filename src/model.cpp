@@ -420,6 +420,7 @@ void Model::run(const int32_t* tokens, int n, float* logits) {
   const int m = static_cast<int>(out_.size());
   if (m == 0) return;
   for (int i = 0; i < m; ++i) rmsnorm(h_.data() + i * E, x_.data() + out_[i] * E, output_norm_, E, c.rms_eps);
+  if (hidden_dst_) std::copy_n(h_.data(), static_cast<size_t>(m) * E, hidden_dst_);
   quantize_acts(h_.data(), m, E, xq_);
   matmul(output_, h_.data(), xq_.data(), m, logits);
   lap(7);

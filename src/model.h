@@ -43,6 +43,8 @@ class Model {
   void pack_wide();
   // First-touch the weights forward reads from the mapped file (those without panels); token embeddings fault lazily.
   void prefetch();
+  // While dst is set, forward also copies the final-norm state of each logits token there (n_embd floats each).
+  void capture_hidden(float* dst) { hidden_dst_ = dst; }
   const ModelConfig& cfg() const { return cfg_; }
   int n_ctx() const { return n_ctx_; }
   int n_seq() const { return n_seq_; }
@@ -65,7 +67,8 @@ class Model {
   void run(const int32_t* tokens, int n, float* logits);
   // Per token: RoPE position, KV row written, first KV row attended, contiguous keys from there.
   std::vector<int> rpos_, kv_at_, kv_base_, n_keys_;
-  std::vector<int> out_;     // tokens whose logits are written
+  std::vector<int> out_;  // tokens whose logits are written
+  float* hidden_dst_ = nullptr;
   std::vector<int> blocks_;  // attention token blocks: start indices, then n
   std::vector<int32_t> ids_;
   struct Layer {

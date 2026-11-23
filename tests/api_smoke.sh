@@ -37,6 +37,14 @@ as=$(curl -sN "$B"/v1/messages -H 'Content-Type: application/json' \
 check "messages stream" "echo \"\$as\" | grep '^data: ' | sed 's/^data: //' | jq -rj 'select(.type==\"content_block_delta\") | .delta.text // empty' | grep -q Rome"
 check "messages stream stop" "echo \"\$as\" | grep -q 'event: message_stop'"
 
+v=$(curl -s "$B"/v1/embeddings -H 'Content-Type: application/json' -d '{"model":"'"$M"'","input":["Paris","Rome"]}')
+check "embeddings unit vectors" "echo '$v' | jq -e '(.data | length) == 2 and (.data | all((.embedding | map(. * .) | add) > 0.999 and (.embedding | map(. * .) | add) < 1.001))' >/dev/null"
+k=$(curl -s "$B"/v1/rerank -H 'Content-Type: application/json' \
+  -d '{"model":"'"$M"'","query":"capital of France","documents":["Paris is the capital of France.","Bread is baked in an oven."],"top_n":1}')
+check "rerank top_n" "echo '$k' | jq -e '(.results | length) == 1 and .results[0].relevance_score >= 0 and .results[0].relevance_score <= 1' >/dev/null"
+ev=$(curl -s -o /dev/null -w '%{http_code}' "$B"/v1/embeddings -H 'Content-Type: application/json' -d '{"input":[]}')
+check "embeddings bad request 400" "[ $ev = 400 ]"
+
 e=$(curl -s -o /dev/null -w '%{http_code}' "$B"/v1/chat/completions -H 'Content-Type: application/json' -d '{"messages":"x"}')
 check "bad request 400" "[ $e = 400 ]"
 exit $fail

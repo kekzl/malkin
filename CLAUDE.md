@@ -18,7 +18,7 @@ Build and run only in Docker; the host has no compiler. Pass `--user $(id -u):$(
 | Run arm64 | `qemu-aarch64 -cpu neoverse-n1 build-arm64/test_quant` (host has no binfmt; ctest uses the emulator via the toolchain file) |
 | CI-equivalent | `docker build --target test .` and `docker buildx build --platform linux/arm64 --target test .` |
 | Runtime image | `docker build -t malkin:local .` (arm64: `docker buildx build --platform linux/arm64 --load ...`) |
-| API test | start `malkin:local --model /models/<file>.gguf` with `-p 127.0.0.1:18080:8080`, then `tests/api_smoke.sh http://127.0.0.1:18080` (14 checks; host port 8080 belongs to imp) |
+| API test | start `malkin:local --model /models/<file>.gguf` with `-p 127.0.0.1:18080:8080`, then `tests/api_smoke.sh http://127.0.0.1:18080` (17 checks; host port 8080 belongs to imp) |
 | Correctness | `malkin ppl --model M -f /models/ppl_4k.txt --window 512` vs `docker run --rm -v /home/kekz/models:/models:ro ghcr.io/ggml-org/llama.cpp:full --perplexity -m M -f /models/ppl_4k.txt -c 512` |
 | Speed | `tools/bench_vs_llama.sh HOST_GGUF 512 128 2` (prefill + decode, back to back); `tools/bench_decode.sh TARGET DRAFT` (4 prompts, plain vs draft vs llama.cpp tg128); `bench_gemm [n] [threads] [rows cols] [type]` (kernel TMAC/s; single-thread runs are the stable A/B on a shared host; at n = 1 the matrix stays in L3); `bench_layers [type] [layers]` (decode GB/s over weights larger than L3); `tools/bench_parallel.sh URL N` (aggregate tok/s of N concurrent requests against a running server) |
 | Lint | `tools/lint.sh` in the deps image: clang-format, clang-tidy (bugprone, performance, warnings are errors), shellcheck; CI adds actionlint |

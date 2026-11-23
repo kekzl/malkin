@@ -172,6 +172,7 @@ cosign verify-blob --bundle malkin-0.2.0-linux-x86_64.tar.gz.sigstore.json \
 |---|---|
 | OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/models` (SSE streaming, `stream_options.include_usage`) |
 | Anthropic | `/v1/messages` (SSE streaming, `thinking` blocks) |
+| Retrieval | `/v1/embeddings` (Qwen3-Embedding: state of the appended `<\|endoftext\|>` token, L2-normalized; `dimensions`, `encoding_format` float or base64), `/v1/rerank` (Qwen3-Reranker: P("yes"), `top_n`, `instruction`, `return_documents`) |
 | Ops | `/health` |
 
 Hybrid reasoning models: `<think>` output goes to `reasoning_content` (OpenAI) or a `thinking` block (Anthropic); `chat_template_kwargs.enable_thinking=false` turns it off. The KV of the longest common token prefix with the previous request is reused. Responses carry `timings` (prefill and generation tokens/s, `draft_n`, `draft_n_accepted`).
