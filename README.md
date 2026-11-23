@@ -160,10 +160,10 @@ Release images and tarballs are signed keyless with cosign:
 ```bash
 cosign verify ghcr.io/kekzl/malkin:latest --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   --certificate-identity-regexp '^https://github\.com/kekzl/malkin/\.github/workflows/release\.yml@refs/tags/'
-cosign verify-blob --bundle malkin-0.2.0-linux-x86_64.tar.gz.sigstore.json \
+cosign verify-blob --bundle malkin-0.3.0-linux-x86_64.tar.gz.sigstore.json \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   --certificate-identity-regexp '^https://github\.com/kekzl/malkin/\.github/workflows/release\.yml@refs/tags/' \
-  malkin-0.2.0-linux-x86_64.tar.gz
+  malkin-0.3.0-linux-x86_64.tar.gz
 ```
 
 ## What it serves

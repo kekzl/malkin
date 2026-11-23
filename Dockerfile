@@ -33,7 +33,7 @@ FROM build AS test
 RUN ctest --test-dir build --output-on-failure
 
 # Release tarball: bin/malkin launcher, libexec/malkin, lib/ (libc++, libomp). glibc and PCRE2 come from the host.
-# docker buildx build --platform linux/arm64 --target bundle --build-arg VERSION=0.2.0 -o dist .
+# docker buildx build --platform linux/arm64 --target bundle --build-arg VERSION=0.3.0 -o dist .
 FROM build AS bundle-build
 ARG VERSION=dev
 ARG TARGETARCH
