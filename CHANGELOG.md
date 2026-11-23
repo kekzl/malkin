@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- `/v1/embeddings` for Qwen3-Embedding GGUFs: final-norm state of the appended `<|endoftext|>` token, L2-normalized; `input` string or array, `dimensions` (prefix, normalized again), `encoding_format` float or base64. Qwen3-Embedding-0.6B Q8_0, 4 inputs, cosine to llama.cpp (`--embedding --pooling last`, same file): 0.9980, 0.9779, 0.9955, 0.9968; token counts equal (35).
+- `/v1/rerank` for Qwen3-Reranker GGUFs: `relevance_score` = P("yes") over {"yes", "no"} after the judge prompt; `top_n`, `instruction`, `return_documents`. Documents of one request share the system + instruction + query prefix, whose KV is reused. Qwen3-Reranker-0.6B Q8_0, 4 documents: same order as llama.cpp (`--reranking`), scores 0.996 / 0.0001 / 0.0001 / 0.9991 vs 0.998 / 0.0001 / 0.0001 / 0.9991.
+- `Engine::probe`: evaluates a token sequence between generations and returns the last token's hidden state and chosen logits. `tools/check_embed.sh` compares both endpoints with llama.cpp; `tests/api_smoke.sh` has 17 checks.
+- Retrieval over 50 notes and 30 queries (secondBrain `brain eval`, 9800X3D): recall@5 equal to llama.cpp in all modes (vector 30/30, FTS + vector fused 28/30, reranked 30/30); reranked mode (query embedding + up to 20 documents scored) 440 ms vs 3355 ms per query (llama.cpp run at load 3.18, malkin at 0.79: not an idle-host comparison).
+
 ## 0.2.0 (2026-11-17)
 
 - Q6_K wide (prefill) kernel: signed weights, activations + 128, the per-row shift preloaded into the integer accumulators, both 16-value halves scaled once per Q8 block.

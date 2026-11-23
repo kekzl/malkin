@@ -2,7 +2,9 @@
 
 #include <httplib.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <nlohmann/json.hpp>
 #include <random>
@@ -26,6 +28,22 @@ std::string rand_id(const char* prefix) {
   char buf[17];
   std::snprintf(buf, sizeof buf, "%016llx", static_cast<unsigned long long>(rng()));
   return std::string(prefix) + buf;
+}
+
+// Standard base64 with padding (OpenAI encoding_format "base64": little-endian float32 bytes).
+std::string base64(const void* data, size_t n) {
+  static const char* const kAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const auto* p = static_cast<const unsigned char*>(data);
+  std::string out;
+  out.reserve((n + 2) / 3 * 4);
+  for (size_t i = 0; i < n; i += 3) {
+    const unsigned v = (p[i] << 16) | (i + 1 < n ? p[i + 1] << 8 : 0) | (i + 2 < n ? p[i + 2] : 0);
+    out += kAlphabet[v >> 18];
+    out += kAlphabet[(v >> 12) & 63];
+    out += i + 1 < n ? kAlphabet[(v >> 6) & 63] : '=';
+    out += i + 2 < n ? kAlphabet[v & 63] : '=';
+  }
+  return out;
 }
 
 void send_error(httplib::Response& res, int status, const std::string& msg) {
@@ -206,6 +224,8 @@ class Server {
     svr.Post("/v1/chat/completions", wrap([this](const json& b, httplib::Response& res) { chat(b, res); }));
     svr.Post("/v1/completions", wrap([this](const json& b, httplib::Response& res) { completion(b, res); }));
     svr.Post("/v1/messages", wrap([this](const json& b, httplib::Response& res) { messages(b, res); }));
+    svr.Post("/v1/embeddings", wrap([this](const json& b, httplib::Response& res) { embeddings(b, res); }));
+    svr.Post("/v1/rerank", wrap([this](const json& b, httplib::Response& res) { rerank(b, res); }));
   }
 
  private:
@@ -311,6 +331,122 @@ class Server {
           sink.done();
           return true;
         }));
+  }
+
+  // Qwen3-Embedding: the state of the appended <|endoftext|> token, L2-normalized; `dimensions` keeps a prefix
+  // (Matryoshka) and normalizes again. Input text never parses control tokens.
+  void embeddings(const json& b, httplib::Response& res) {
+    std::vector<std::string> inputs;
+    const json in = b.value("input", json());
+    if (in.is_string()) {
+      inputs.push_back(in.get<std::string>());
+    } else if (in.is_array() && !in.empty() &&
+               std::all_of(in.begin(), in.end(), [](const json& x) { return x.is_string(); })) {
+      for (const auto& x : in) inputs.push_back(x.get<std::string>());
+    } else {
+      throw BadRequest("input must be a string or a non-empty array of strings");
+    }
+    const std::string format = b.value("encoding_format", "float");
+    if (format != "float" && format != "base64") throw BadRequest("encoding_format must be float or base64");
+    const int n_embd = e_.cfg().n_embd;
+    int dims = n_embd;
+    if (b.contains("dimensions") && !b["dimensions"].is_null()) dims = b["dimensions"].get<int>();
+    if (dims < 1 || dims > n_embd) throw BadRequest("dimensions must be 1.." + std::to_string(n_embd));
+
+    const auto& tok = e_.tokenizer();
+    const int32_t eot = tok.find("<|endoftext|>");
+    json data = json::array();
+    int tokens = 0;
+    double ms = 0;
+    for (size_t i = 0; i < inputs.size(); ++i) {
+      std::vector<int32_t> ids;
+      if (tok.add_bos()) ids.push_back(tok.bos());
+      auto text = tok.encode(inputs[i], false);
+      ids.insert(ids.end(), text.begin(), text.end());
+      if (eot >= 0) ids.push_back(eot);
+      Engine::Probe p = e_.probe(ids, {});
+      tokens += p.tokens;
+      ms += p.ms;
+      p.hidden.resize(dims);
+      double norm = 0;
+      for (float v : p.hidden) norm += static_cast<double>(v) * v;
+      const float inv = norm > 0 ? static_cast<float>(1.0 / std::sqrt(norm)) : 0.0f;
+      for (float& v : p.hidden) v *= inv;
+      json item = {{"object", "embedding"}, {"index", i}};
+      if (format == "base64") {
+        item["embedding"] = base64(p.hidden.data(), p.hidden.size() * sizeof(float));
+      } else {
+        item["embedding"] = p.hidden;
+      }
+      data.push_back(std::move(item));
+    }
+    std::fprintf(stderr, "embeddings: %zu inputs, %d tokens, %.1f ms\n", inputs.size(), tokens, ms);
+    json out = {{"object", "list"},
+                {"data", std::move(data)},
+                {"model", e_.model_id()},
+                {"usage", {{"prompt_tokens", tokens}, {"total_tokens", tokens}}}};
+    res.set_content(out.dump(), "application/json");
+  }
+
+  // Qwen3-Reranker: relevance_score = P("yes") over {"yes", "no"} after the judge prompt with an empty think
+  // block. Documents share the system + instruction + query prefix, whose KV is reused from the second on.
+  void rerank(const json& b, httplib::Response& res) {
+    if (!e_.chat().supported()) throw BadRequest("rerank needs a ChatML reranker model (Qwen3-Reranker)");
+    if (!b.contains("query") || !b["query"].is_string()) throw BadRequest("query must be a string");
+    const json docs_in = b.value("documents", json());
+    if (!docs_in.is_array() || docs_in.empty()) throw BadRequest("documents must be a non-empty array");
+    std::vector<std::string> docs;
+    for (const auto& d : docs_in) {
+      if (d.is_string()) {
+        docs.push_back(d.get<std::string>());
+      } else if (d.is_object() && d.contains("text") && d["text"].is_string()) {
+        docs.push_back(d["text"].get<std::string>());
+      } else {
+        throw BadRequest("each document must be a string or an object with a text string");
+      }
+    }
+    const auto& tok = e_.tokenizer();
+    const int32_t yes = tok.find("yes"), no = tok.find("no");
+    if (yes < 0 || no < 0) throw BadRequest("this tokenizer has no yes/no tokens");
+    const std::string instruction =
+        b.value("instruction", "Given a web search query, retrieve relevant passages that answer the query");
+    const std::string head =
+        "<Instruct>: " + instruction + "\n<Query>: " + b["query"].get<std::string>() + "\n<Document>: ";
+    const auto think = tok.encode("<think>\n\n</think>\n\n", true);
+
+    std::vector<std::pair<double, size_t>> scored;
+    int tokens = 0;
+    double ms = 0;
+    for (size_t i = 0; i < docs.size(); ++i) {
+      auto ids = e_.chat().tokenize(
+          {{"system",
+            "Judge whether the Document meets the requirements based on the Query and the Instruct provided. Note "
+            "that the answer can only be \"yes\" or \"no\"."},
+           {"user", head + docs[i]}},
+          true);
+      ids.insert(ids.end(), think.begin(), think.end());
+      Engine::Probe p = e_.probe(ids, {yes, no});
+      tokens += p.tokens;
+      ms += p.ms;
+      scored.emplace_back(1.0 / (1.0 + std::exp(static_cast<double>(p.logits[1]) - p.logits[0])), i);
+    }
+    std::stable_sort(scored.begin(), scored.end(), [](const auto& a, const auto& c) { return a.first > c.first; });
+    size_t top_n = docs.size();
+    if (b.contains("top_n") && b["top_n"].is_number_integer())
+      top_n = std::min<size_t>(top_n, static_cast<size_t>(std::max(1, b["top_n"].get<int>())));
+    const bool with_docs = b.value("return_documents", false);
+    json results = json::array();
+    for (size_t r = 0; r < top_n; ++r) {
+      json item = {{"index", scored[r].second}, {"relevance_score", scored[r].first}};
+      if (with_docs) item["document"] = {{"text", docs[scored[r].second]}};
+      results.push_back(std::move(item));
+    }
+    std::fprintf(stderr, "rerank: %zu documents, %d tokens, %.1f ms\n", docs.size(), tokens, ms);
+    json out = {{"object", "rerank"},
+                {"model", e_.model_id()},
+                {"results", std::move(results)},
+                {"usage", {{"prompt_tokens", tokens}, {"total_tokens", tokens}}}};
+    res.set_content(out.dump(), "application/json");
   }
 
   void completion(const json& b, httplib::Response& res) {

@@ -517,6 +517,42 @@ void Engine::finish(Slot& s) {
   --busy_;
 }
 
+Engine::Probe Engine::probe(const std::vector<int32_t>& tokens, const std::vector<int32_t>& ids) {
+  const int n = static_cast<int>(tokens.size());
+  if (n == 0) throw std::invalid_argument("input is empty");
+  if (n > model_->n_ctx())
+    throw std::invalid_argument("input has " + std::to_string(n) + " tokens, context is " +
+                                std::to_string(model_->n_ctx()));
+  const int n_vocab = model_->cfg().n_vocab;
+  for (int32_t id : ids)
+    if (id < 0 || id >= n_vocab) throw std::invalid_argument("token id out of range");
+  std::lock_guard lock(mu_);
+  return on_worker([&] {
+    omp_set_num_threads(threads_batch_);
+    auto t0 = std::chrono::steady_clock::now();
+    auto& cache = slots_[0].cache;
+    int start = 0;
+    while (start < n - 1 && start < static_cast<int>(cache.size()) && cache[start] == tokens[start]) ++start;
+    cache.clear();  // stays empty if forward throws
+    Probe p;
+    p.tokens = n;
+    p.cached = start;
+    p.hidden.resize(model_->cfg().n_embd);
+    std::vector<float> logits(n_vocab);
+    struct Capture {
+      Model& m;
+      ~Capture() { m.capture_hidden(nullptr); }
+    } capture{*model_};
+    model_->capture_hidden(p.hidden.data());
+    for (int i = start; i < n; i += Model::kMaxBatch)
+      model_->forward(tokens.data() + i, std::min(Model::kMaxBatch, n - i), i, logits.data(), false);
+    cache = tokens;
+    for (int32_t id : ids) p.logits.push_back(logits[id]);
+    p.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    return p;
+  });
+}
+
 double Engine::perplexity(const std::string& text, int window, int* scored) {
   std::lock_guard lock(mu_);
   return on_worker([&] { return perplexity_locked(text, window, scored); });
