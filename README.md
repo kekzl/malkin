@@ -223,7 +223,7 @@ Toolchain: C++26, LLVM 23 (clang, lld, libc++, libomp), CMake 4.4, Ninja 1.13, a
 ```bash
 docker build --target test .                          # x86 kernel + sampler tests (kernels skip without AVX-512 BF16)
 docker build --target test --platform linux/arm64 .   # same through qemu, Neoverse-N1 CPU model
-tests/api_smoke.sh http://127.0.0.1:8080              # 14 API checks against a running server
+tests/api_smoke.sh http://127.0.0.1:8080              # 18 API checks against a running server
 tools/bench_vs_llama.sh /path/model.gguf 512 128 2    # malkin vs llama.cpp, back to back
 ```
 
