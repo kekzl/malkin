@@ -356,17 +356,18 @@ class Server {
     const auto& tok = e_.tokenizer();
     const int32_t eot = tok.find("<|endoftext|>");
     json data = json::array();
-    int tokens = 0;
-    double ms = 0;
-    for (size_t i = 0; i < inputs.size(); ++i) {
-      std::vector<int32_t> ids;
+    std::vector<std::vector<int32_t>> prompts;
+    for (const auto& input : inputs) {
+      auto& ids = prompts.emplace_back();
       if (tok.add_bos()) ids.push_back(tok.bos());
-      auto text = tok.encode(inputs[i], false);
+      auto text = tok.encode(input, false);
       ids.insert(ids.end(), text.begin(), text.end());
       if (eot >= 0) ids.push_back(eot);
-      Engine::Probe p = e_.probe(ids, {});
-      tokens += p.tokens;
-      ms += p.ms;
+    }
+    Engine::Probes probes = e_.probe(prompts, {});
+    const int tokens = probes.tokens;
+    for (size_t i = 0; i < inputs.size(); ++i) {
+      Engine::Probe& p = probes.items[i];
       p.hidden.resize(dims);
       double norm = 0;
       for (float v : p.hidden) norm += static_cast<double>(v) * v;
@@ -380,7 +381,8 @@ class Server {
       }
       data.push_back(std::move(item));
     }
-    std::fprintf(stderr, "embeddings: %zu inputs, %d tokens, %.1f ms\n", inputs.size(), tokens, ms);
+    std::fprintf(stderr, "embeddings: %zu inputs, %d tokens (%d evaluated), %.1f ms\n", inputs.size(), tokens,
+                 probes.evaluated, probes.ms);
     json out = {{"object", "list"},
                 {"data", std::move(data)},
                 {"model", e_.model_id()},
@@ -389,7 +391,7 @@ class Server {
   }
 
   // Qwen3-Reranker: relevance_score = P("yes") over {"yes", "no"} after the judge prompt with an empty think
-  // block. Documents share the system + instruction + query prefix, whose KV is reused from the second on.
+  // block. Documents share the system + instruction + query prefix (evaluated once) and their forward passes.
   void rerank(const json& b, httplib::Response& res) {
     if (!e_.chat().supported()) throw BadRequest("rerank needs a ChatML reranker model (Qwen3-Reranker)");
     if (!b.contains("query") || !b["query"].is_string()) throw BadRequest("query must be a string");
@@ -414,21 +416,22 @@ class Server {
         "<Instruct>: " + instruction + "\n<Query>: " + b["query"].get<std::string>() + "\n<Document>: ";
     const auto think = tok.encode("<think>\n\n</think>\n\n", true);
 
-    std::vector<std::pair<double, size_t>> scored;
-    int tokens = 0;
-    double ms = 0;
-    for (size_t i = 0; i < docs.size(); ++i) {
-      auto ids = e_.chat().tokenize(
+    std::vector<std::vector<int32_t>> prompts;
+    for (const auto& doc : docs) {
+      prompts.push_back(e_.chat().tokenize(
           {{"system",
             "Judge whether the Document meets the requirements based on the Query and the Instruct provided. Note "
             "that the answer can only be \"yes\" or \"no\"."},
-           {"user", head + docs[i]}},
-          true);
-      ids.insert(ids.end(), think.begin(), think.end());
-      Engine::Probe p = e_.probe(ids, {yes, no});
-      tokens += p.tokens;
-      ms += p.ms;
-      scored.emplace_back(1.0 / (1.0 + std::exp(static_cast<double>(p.logits[1]) - p.logits[0])), i);
+           {"user", head + doc}},
+          true));
+      prompts.back().insert(prompts.back().end(), think.begin(), think.end());
+    }
+    const Engine::Probes probes = e_.probe(prompts, {yes, no});
+    const int tokens = probes.tokens;
+    std::vector<std::pair<double, size_t>> scored;
+    for (size_t i = 0; i < docs.size(); ++i) {
+      const auto& l = probes.items[i].logits;
+      scored.emplace_back(1.0 / (1.0 + std::exp(static_cast<double>(l[1]) - l[0])), i);
     }
     std::stable_sort(scored.begin(), scored.end(), [](const auto& a, const auto& c) { return a.first > c.first; });
     size_t top_n = docs.size();
@@ -441,7 +444,8 @@ class Server {
       if (with_docs) item["document"] = {{"text", docs[scored[r].second]}};
       results.push_back(std::move(item));
     }
-    std::fprintf(stderr, "rerank: %zu documents, %d tokens, %.1f ms\n", docs.size(), tokens, ms);
+    std::fprintf(stderr, "rerank: %zu documents, %d tokens (%d evaluated), %.1f ms\n", docs.size(), tokens,
+                 probes.evaluated, probes.ms);
     json out = {{"object", "rerank"},
                 {"model", e_.model_id()},
                 {"results", std::move(results)},

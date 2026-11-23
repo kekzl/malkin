@@ -59,12 +59,16 @@ class Engine {
   struct Probe {
     std::vector<float> hidden;  // final-norm state of the last token (n_embd)
     std::vector<float> logits;  // logits of the requested ids after the last token
-    int tokens = 0, cached = 0;
+  };
+  struct Probes {
+    std::vector<Probe> items;       // one per prompt, in input order
+    int tokens = 0, evaluated = 0;  // prompt tokens, tokens that went through the model
     double ms = 0;
   };
-  // Evaluates tokens in sequence 0 between generations, reusing the KV of the prefix shared with the previous
-  // use of that sequence. Embeddings read hidden, rerank reads the logits of its two answer tokens.
-  Probe probe(const std::vector<int32_t>& tokens, const std::vector<int32_t>& ids);
+  // Evaluates prompts in sequence 0 between generations. Their common prefix runs once (KV reused from the
+  // previous use of the sequence); the rest of each prompt gets its own KV span, so tokens of different prompts
+  // share forward passes. Embeddings read hidden, rerank reads the logits of its two answer tokens (ids).
+  Probes probe(const std::vector<std::vector<int32_t>>& prompts, const std::vector<int32_t>& ids);
 
   const Tokenizer& tokenizer() const { return *tok_; }
   const ChatFormat& chat() const { return *chat_; }

@@ -517,13 +517,22 @@ void Engine::finish(Slot& s) {
   --busy_;
 }
 
-Engine::Probe Engine::probe(const std::vector<int32_t>& tokens, const std::vector<int32_t>& ids) {
-  const int n = static_cast<int>(tokens.size());
-  if (n == 0) throw std::invalid_argument("input is empty");
-  if (n > model_->n_ctx())
-    throw std::invalid_argument("input has " + std::to_string(n) + " tokens, context is " +
-                                std::to_string(model_->n_ctx()));
-  const int n_vocab = model_->cfg().n_vocab;
+Engine::Probes Engine::probe(const std::vector<std::vector<int32_t>>& prompts, const std::vector<int32_t>& ids) {
+  if (prompts.empty()) throw std::invalid_argument("input is empty");
+  const int n_ctx = model_->n_ctx(), n_vocab = model_->cfg().n_vocab, E = model_->cfg().n_embd;
+  auto len = [&](size_t j) { return static_cast<int>(prompts[j].size()); };
+  Probes out;
+  int prefix = n_ctx;  // common prefix; every prompt keeps at least its last token
+  for (size_t j = 0; j < prompts.size(); ++j) {
+    if (len(j) == 0) throw std::invalid_argument("input is empty");
+    if (len(j) > n_ctx)
+      throw std::invalid_argument("input has " + std::to_string(len(j)) + " tokens, context is " +
+                                  std::to_string(n_ctx));
+    out.tokens += len(j);
+    int same = 0;
+    while (same < std::min(prefix, len(j) - 1) && prompts[j][same] == prompts[0][same]) ++same;
+    prefix = same;
+  }
   for (int32_t id : ids)
     if (id < 0 || id >= n_vocab) throw std::invalid_argument("token id out of range");
   std::lock_guard lock(mu_);
@@ -532,24 +541,65 @@ Engine::Probe Engine::probe(const std::vector<int32_t>& tokens, const std::vecto
     auto t0 = std::chrono::steady_clock::now();
     auto& cache = slots_[0].cache;
     int start = 0;
-    while (start < n - 1 && start < static_cast<int>(cache.size()) && cache[start] == tokens[start]) ++start;
+    while (start < prefix && start < static_cast<int>(cache.size()) && cache[start] == prompts[0][start]) ++start;
     cache.clear();  // stays empty if forward throws
-    Probe p;
-    p.tokens = n;
-    p.cached = start;
-    p.hidden.resize(model_->cfg().n_embd);
-    std::vector<float> logits(n_vocab);
+
+    std::vector<BatchToken> batch;
+    std::vector<size_t> ends;  // prompts whose last token is in the batch, in batch order
+    std::vector<float> hidden;
     struct Capture {
       Model& m;
       ~Capture() { m.capture_hidden(nullptr); }
     } capture{*model_};
-    model_->capture_hidden(p.hidden.data());
-    for (int i = start; i < n; i += Model::kMaxBatch)
-      model_->forward(tokens.data() + i, std::min(Model::kMaxBatch, n - i), i, logits.data(), false);
-    cache = tokens;
-    for (int32_t id : ids) p.logits.push_back(logits[id]);
-    p.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    return p;
+    out.items.resize(prompts.size());
+    auto flush = [&] {
+      if (batch.empty()) return;
+      hidden.resize(ends.size() * E);
+      model_->capture_hidden(hidden.data());
+      model_->forward(batch.data(), static_cast<int>(batch.size()), nullptr);
+      for (size_t i = 0; i < ends.size(); ++i) {
+        Probe& p = out.items[ends[i]];
+        p.hidden.assign(hidden.begin() + i * E, hidden.begin() + (i + 1) * E);
+        p.logits.resize(ids.size());
+        model_->logits_of(p.hidden.data(), ids.data(), static_cast<int>(ids.size()), p.logits.data());
+      }
+      out.evaluated += static_cast<int>(batch.size());
+      batch.clear();
+      ends.clear();
+    };
+    auto feed = [&](size_t j, int base, int from) {
+      for (int pos = from; pos < len(j); ++pos) {
+        const bool last = pos == len(j) - 1;
+        batch.push_back({prompts[j][pos], 0, pos, last, -1, -1, base});
+        if (last) ends.push_back(j);
+        if (static_cast<int>(batch.size()) == Model::kMaxBatch) flush();
+      }
+    };
+    for (int pos = start; pos < prefix; ++pos) {
+      batch.push_back({prompts[0][pos], 0, pos, false});
+      if (static_cast<int>(batch.size()) == Model::kMaxBatch) flush();
+    }
+    // Waves: the first prompt continues the prefix in place (same pass), each further one gets a span behind it
+    // that starts with a copy of the prefix KV. A wave ends at kWave own tokens (4 passes) or a full context, so
+    // the KV rows a request touches stay bounded: 59 KiB per row for Qwen3-0.6B.
+    constexpr int kWave = 4 * Model::kMaxBatch;
+    for (size_t j = 0; j < prompts.size();) {
+      feed(j, 0, prefix);
+      int row = len(j), own = len(j) - prefix;
+      for (++j; j < prompts.size() && own < kWave && len(j) <= n_ctx - row; ++j) {
+        if (start < prefix) flush();  // the copy needs the prefix rows written
+        start = prefix;
+        model_->copy_kv(0, row, prefix);
+        feed(j, row, prefix);
+        row += len(j);
+        own += len(j) - prefix;
+      }
+      flush();
+      start = prefix;
+    }
+    cache.assign(prompts[0].begin(), prompts[0].begin() + prefix);
+    out.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    return out;
   });
 }
 

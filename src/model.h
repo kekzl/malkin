@@ -22,11 +22,14 @@ size_t kv_bytes_per_token(const ModelConfig& c);
 // One token of a multi-sequence batch. Plain (parent < 0): RoPE position and KV row pos, attends to positions
 // 0..pos of its sequence. Tree (parent = batch index of a token of the same sequence): KV row kv, attends to the
 // keys of its parent plus itself, in that order (same key order as plain decode of the accepted path).
+// base: first KV row of the token's span inside its sequence; the span holds rows base..base+pos and is its own
+// context (probes: one span per document, each starting with a copy of the shared prefix).
 struct BatchToken {
   int32_t id;
   int seq, pos;
   bool logits;  // write n_vocab logits for this token
   int kv = -1, parent = -1;
+  int base = 0;
 };
 
 // Qwen3 dense decoder over n_seq sequences of n_ctx positions each, int8 KV cache.
@@ -50,8 +53,12 @@ class Model {
   int n_seq() const { return n_seq_; }
 
   // Tokens of several sequences in one pass (weights read once). KV of each sequence must be valid below pos.
-  // logits: n_vocab floats per token with .logits set, in batch order.
+  // logits: n_vocab floats per token with .logits set, in batch order; null skips the LM head (capture_hidden).
   void forward(const BatchToken* batch, int n, float* logits);
+  // Logits of n vocabulary ids for one captured hidden state: n rows of the LM head instead of n_vocab.
+  void logits_of(const float* hidden, const int32_t* ids, int n, float* out);
+  // Copy n KV rows from row `from` to row `to` of sequence seq (all layers); the ranges must not overlap.
+  void copy_kv(int from, int to, int n, int seq = 0);
 
   // Evaluate n tokens of sequence seq at positions pos..pos+n-1 (n <= kMaxBatch); KV for those positions is
   // overwritten. logits: n_vocab floats for the last token, or n * n_vocab when all_logits. parent (optional, tree

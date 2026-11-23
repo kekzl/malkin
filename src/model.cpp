@@ -292,13 +292,14 @@ void Model::forward(const BatchToken* batch, int n, float* logits) {
   for (int t = 0; t < n; ++t) {
     const BatchToken& b = batch[t];
     const int kv = b.parent < 0 ? b.pos : b.kv;
-    if (b.seq < 0 || b.seq >= n_seq_ || b.pos < 0 || b.pos >= n_ctx_ || kv < 0 || kv >= n_ctx_)
+    if (b.seq < 0 || b.seq >= n_seq_ || b.pos < 0 || kv < 0 || b.base < 0 || b.pos >= n_ctx_ - b.base ||
+        kv >= n_ctx_ - b.base)
       throw std::runtime_error("forward: bad slot");
-    if (b.parent >= t || (b.parent >= 0 && batch[b.parent].seq != b.seq))
+    if (b.parent >= t || (b.parent >= 0 && (batch[b.parent].seq != b.seq || batch[b.parent].base != b.base)))
       throw std::runtime_error("forward: bad tree parent");
     ids_[t] = b.id;
     rpos_[t] = b.pos;
-    kv_base_[t] = b.seq * n_ctx_;
+    kv_base_[t] = b.seq * n_ctx_ + b.base;
     kv_at_[t] = kv_base_[t] + kv;
     tree = tree || b.parent >= 0;
     if (b.logits) out_.push_back(t);
@@ -421,6 +422,7 @@ void Model::run(const int32_t* tokens, int n, float* logits) {
   if (m == 0) return;
   for (int i = 0; i < m; ++i) rmsnorm(h_.data() + i * E, x_.data() + out_[i] * E, output_norm_, E, c.rms_eps);
   if (hidden_dst_) std::copy_n(h_.data(), static_cast<size_t>(m) * E, hidden_dst_);
+  if (!logits) return;
   quantize_acts(h_.data(), m, E, xq_);
   matmul(output_, h_.data(), xq_.data(), m, logits);
   lap(7);
@@ -429,6 +431,26 @@ void Model::run(const int32_t* tokens, int n, float* logits) {
 }  // namespace malkin
 
 namespace malkin {
+
+void Model::logits_of(const float* hidden, const int32_t* ids, int n, float* out) {
+  quantize_acts(hidden, 1, cfg_.n_embd, xq_);
+  for (int i = 0; i < n; ++i) {
+    if (ids[i] < 0 || ids[i] >= output_.rows) throw std::runtime_error("logits_of: token id out of range");
+    out[i] = vec_dot(output_.type, cfg_.n_embd, output_.row(ids[i]), hidden, xq_.data());
+  }
+}
+
+void Model::copy_kv(int from, int to, int n, int seq) {
+  if (n <= 0) return;
+  if (from < 0 || to < 0 || from + n > n_ctx_ || to + n > n_ctx_ || (from < to + n && to < from + n))
+    throw std::runtime_error("copy_kv: bad range");
+  const size_t row = kv_row_bytes(cfg_);
+  for (int il = 0; il < cfg_.n_layer; ++il) {
+    const size_t base = static_cast<size_t>(il) * n_seq_ * n_ctx_ + static_cast<size_t>(seq) * n_ctx_;
+    std::memcpy(kcache_.data() + (base + to) * row, kcache_.data() + (base + from) * row, n * row);
+    std::memcpy(vcache_.data() + (base + to) * row, vcache_.data() + (base + from) * row, n * row);
+  }
+}
 
 void Model::move_kv(int from, int to, int seq) {
   if (from == to) return;

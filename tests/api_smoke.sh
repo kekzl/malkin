@@ -42,6 +42,10 @@ check "embeddings unit vectors" "echo '$v' | jq -e '(.data | length) == 2 and (.
 k=$(curl -s "$B"/v1/rerank -H 'Content-Type: application/json' \
   -d '{"model":"'"$M"'","query":"capital of France","documents":["Paris is the capital of France.","Bread is baked in an oven."],"top_n":1}')
 check "rerank top_n" "echo '$k' | jq -e '(.results | length) == 1 and .results[0].relevance_score >= 0 and .results[0].relevance_score <= 1' >/dev/null"
+rr() { curl -s "$B"/v1/rerank -H 'Content-Type: application/json' -d '{"model":"'"$M"'","query":"capital of France","documents":'"$1"'}'; }
+kb=$(rr '["Paris is the capital of France.","Bread is baked in an oven.","Rome is the capital of Italy, a country south of the Alps."]')
+ks=$(rr '["Rome is the capital of Italy, a country south of the Alps."]')
+check "rerank batch equals single" "jq -en --argjson b '$kb' --argjson s '$ks' '((\$b.results[] | select(.index == 2).relevance_score) - \$s.results[0].relevance_score) | fabs < 1e-6' >/dev/null"
 ev=$(curl -s -o /dev/null -w '%{http_code}' "$B"/v1/embeddings -H 'Content-Type: application/json' -d '{"input":[]}')
 check "embeddings bad request 400" "[ $ev = 400 ]"
 
